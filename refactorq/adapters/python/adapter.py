@@ -406,7 +406,8 @@ class PythonAdapter:
         is_package = path.name == "__init__.py"
         imports: set[str] = set()
         candidates: list[Candidate] = []
-        layer_violations: set[tuple[int, str]] = set()
+        layer_violations: list[tuple[int, str, tuple[str, ...]]] = []
+        seen_layer_violations: set[tuple[int, str, tuple[str, ...]]] = set()
         duplicate_functions: list[tuple[str, int, int, str]] = []
         passthrough_functions: list[tuple[str, int, int, str]] = []
         top_level_statements = len(tree.body)
@@ -493,11 +494,21 @@ class PythonAdapter:
                     )
                 resolved_targets = _resolve_import_targets(current_module, is_package, node, known_modules)
                 current_layer = _path_layer(rel_path)
+                imported_symbols = tuple(
+                    sorted(
+                        bound_name
+                        for alias in node.names
+                        if (bound_name := (alias.asname or alias.name.split(".")[0])) != "*"
+                    )
+                )
                 for target_module in resolved_targets:
                     target_rel_path = known_modules.get(target_module)
                     target_layer = _path_layer(target_rel_path) if target_rel_path else None
                     if current_layer and target_rel_path and target_layer and current_layer != target_layer:
-                        layer_violations.add((node.lineno, target_rel_path))
+                        violation = (node.lineno, target_rel_path, imported_symbols)
+                        if violation not in seen_layer_violations:
+                            seen_layer_violations.add(violation)
+                            layer_violations.append(violation)
                 imports.update(resolved_targets)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.end_lineno is not None:
                 length = node.end_lineno - node.lineno + 1
@@ -593,7 +604,7 @@ class PythonAdapter:
 
         candidates.extend(_build_duplicate_candidates(rel_path, duplicate_functions))
         candidates.extend(_build_remove_abstraction_candidates(rel_path, passthrough_functions))
-        for line_number, target_rel_path in sorted(layer_violations):
+        for line_number, target_rel_path, imported_symbols in sorted(layer_violations):
             candidates.append(
                 Candidate(
                     id=f"py-layer-violation-{rel_path}-{line_number}-{target_rel_path.replace('/', '-')}",
@@ -607,6 +618,7 @@ class PythonAdapter:
                     scope="architecture",
                     source=["graph"],
                     files=[rel_path, target_rel_path],
+                    symbols=list(imported_symbols),
                     anchorRegions=[_region(rel_path, line_number, line_number)],
                     estimatedBenefit=_benefit({"maintainabilityGain": 0.32}),
                     estimatedRisk=_risk({"semanticRisk": 0.22, "apiRisk": 0.1, "testRisk": 0.18, "conflictRisk": 0.12}),
@@ -620,4 +632,33 @@ class PythonAdapter:
                     ),
                 )
             )
+            if imported_symbols:
+                symbol_summary = ", ".join(f"`{symbol}`" for symbol in imported_symbols)
+                candidates.append(
+                    Candidate(
+                        id=f"py-move-symbol-{rel_path}-{line_number}-{target_rel_path.replace('/', '-')}",
+                        kind="move_symbol",
+                        title=f"Review moving imported boundary symbols from {target_rel_path}",
+                        description=(
+                            f"Imported symbols {symbol_summary} cross between `{rel_path}` and `{target_rel_path}` and may"
+                            " need relocation behind a clearer module boundary"
+                        ),
+                        language="python",
+                        scope="architecture",
+                        source=["graph"],
+                        files=[rel_path, target_rel_path],
+                        symbols=list(imported_symbols),
+                        anchorRegions=[_region(rel_path, line_number, line_number)],
+                        estimatedBenefit=_benefit({"maintainabilityGain": 0.28}),
+                        estimatedRisk=_risk({"semanticRisk": 0.28, "apiRisk": 0.16, "testRisk": 0.22, "conflictRisk": 0.14}),
+                        estimatedDiff=_diff({"filesTouched": 2, "linesAdded": 6, "linesModified": 10}),
+                        confidence=0.64,
+                        applyModeHint="report_only",
+                        requiredChecks=["parse", "lint", "typecheck", "unit_test"],
+                        provenance=Provenance(
+                            detectors=["python-import-move-symbol"],
+                            evidence=[f"line:{line_number}", f"target:{target_rel_path}", *[f"symbol:{symbol}" for symbol in imported_symbols]],
+                        ),
+                    )
+                )
         return candidates, imports

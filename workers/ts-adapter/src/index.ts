@@ -98,7 +98,7 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle" | "layer_violation_fix";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle" | "layer_violation_fix" | "move_symbol";
 
   title: string;
   description: string;
@@ -682,6 +682,23 @@ function stronglyConnectedComponents(root: string, graph: Map<string, Set<string
   return components;
 }
 
+function importSymbols(clause: ts.ImportClause | undefined): string[] {
+  if (!clause) {
+    return [];
+  }
+  const symbols: string[] = [];
+  if (clause.name) {
+    symbols.push(clause.name.text);
+  }
+  const bindings = clause.namedBindings;
+  if (bindings && ts.isNamedImports(bindings)) {
+    for (const element of bindings.elements) {
+      symbols.push(element.name.text);
+    }
+  }
+  return symbols;
+}
+
 function buildLayerViolationCandidates(root: string, files: string[], program: ts.Program): CandidatePayload[] {
   const knownFiles = new Set(files);
   const candidates: CandidatePayload[] = [];
@@ -710,6 +727,7 @@ function buildLayerViolationCandidates(root: string, files: string[], program: t
         continue;
       }
       const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+      const symbols = importSymbols(statement.importClause);
       candidates.push({
         id: `ts-layer-violation-${relPath}-${startLine}-${targetRelPath.replaceAll("/", "-")}`,
         kind: "layer_violation_fix",
@@ -719,7 +737,7 @@ function buildLayerViolationCandidates(root: string, files: string[], program: t
         scope: "package",
         source: ["graph"],
         files: [relPath, targetRelPath],
-        symbols: [],
+        symbols,
         anchorRegions: [{ file: relPath, startLine, endLine: startLine }],
         estimatedBenefit: { maintainabilityGain: 0.32 },
         estimatedRisk: { semanticRisk: 0.22, apiRisk: 0.1, testRisk: 0.18, conflictRisk: 0.12 },
@@ -736,6 +754,34 @@ function buildLayerViolationCandidates(root: string, files: string[], program: t
           evidence: [`line:${startLine}`, `target:${targetRelPath}`],
         },
       });
+      if (symbols.length > 0) {
+        candidates.push({
+          id: `ts-move-symbol-${relPath}-${startLine}-${targetRelPath.replaceAll("/", "-")}`,
+          kind: "move_symbol",
+          title: `Review moving imported boundary symbols from ${targetRelPath}`,
+          description: `Imported symbols ${symbols.map((symbol) => `\`${symbol}\``).join(", ")} cross between \`${relPath}\` and \`${targetRelPath}\` and may need relocation behind a clearer module boundary`,
+          language: "typescript",
+          scope: "package",
+          source: ["graph"],
+          files: [relPath, targetRelPath],
+          symbols,
+          anchorRegions: [{ file: relPath, startLine, endLine: startLine }],
+          estimatedBenefit: { maintainabilityGain: 0.28 },
+          estimatedRisk: { semanticRisk: 0.28, apiRisk: 0.16, testRisk: 0.22, conflictRisk: 0.14 },
+          estimatedDiff: { filesTouched: 2, linesAdded: 6, linesModified: 10 },
+          contextSignals: createEmptyContextSignals(),
+          boundaryImpact: createEmptyBoundaryImpact(),
+          confidence: 0.64,
+          applyModeHint: "report_only",
+          requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+          dependencies: [],
+          conflicts: [],
+          provenance: {
+            detectors: ["ts-worker-move-symbol"],
+            evidence: [`line:${startLine}`, `target:${targetRelPath}`, ...symbols.map((symbol) => `symbol:${symbol}`)],
+          },
+        });
+      }
     }
   }
 

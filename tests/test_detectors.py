@@ -72,6 +72,9 @@ def test_python_adapter_detects_layer_violation_candidate(tmp_path: Path) -> Non
     candidates = PythonAdapter().scan(tmp_path)
 
     assert any(candidate.kind == "layer_violation_fix" and candidate.files == ["frontend/ui.py", "backend/service.py"] for candidate in candidates)
+    move_symbol = next(candidate for candidate in candidates if candidate.kind == "move_symbol")
+    assert move_symbol.files == ["frontend/ui.py", "backend/service.py"]
+    assert move_symbol.symbols == ["service"]
 
 
 def test_python_adapter_detects_import_cycle_candidate(tmp_path: Path) -> None:
@@ -354,6 +357,9 @@ def test_ts_worker_emits_layer_violation_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "layer_violation_fix" and candidate["files"] == ["frontend/ui.ts", "backend/service.ts"] for candidate in payload["candidates"])
+    move_symbol = next(candidate for candidate in payload["candidates"] if candidate["kind"] == "move_symbol")
+    assert move_symbol["files"] == ["frontend/ui.ts", "backend/service.ts"]
+    assert move_symbol["symbols"] == ["service"]
 
 def test_ts_worker_emits_reduce_cycle_candidates(tmp_path: Path) -> None:
     (tmp_path / "a.ts").write_text('import "./b";\nexport const a = 1;\n', encoding="utf-8")

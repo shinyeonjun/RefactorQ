@@ -95,6 +95,8 @@ def _balanced_filter(candidate: Candidate) -> str | None:
     if _is_boundary_changing(candidate):
         return "boundary-changing candidate requires stronger verification than balanced mode baseline"
     if _is_cross_language(candidate):
+        if not candidate.boundary_impact.contract_artifacts:
+            return "cross-language candidate requires explicit boundary contract artifacts before balanced execution"
         if candidate.boundary_impact.impact_level != "low":
             return "cross-language candidate requires lower boundary impact before balanced execution"
         if candidate.apply_mode_hint == "guarded" and not _is_contract_preserving_cross_language_candidate(candidate):
@@ -115,6 +117,28 @@ def _report_filter(candidate: Candidate) -> str | None:
 def _candidate_diff_lines(candidate: Candidate) -> int:
     diff = candidate.estimated_diff
     return diff.lines_modified + diff.lines_added + diff.lines_deleted
+
+
+def _candidate_score(candidate: Candidate) -> float:
+    benefit = candidate.estimated_benefit
+    risk = candidate.estimated_risk
+    diff = candidate.estimated_diff
+    return (
+        2.5 * benefit.cycle_reduction
+        + 2.0 * benefit.complexity_reduction
+        + 2.0 * benefit.duplication_reduction
+        + 1.5 * benefit.maintainability_gain
+        + 1.0 * benefit.perf_gain
+        + 0.8 * candidate.confidence
+        - 2.1 * risk.semantic_risk
+        - 1.6 * risk.api_risk
+        - 1.2 * risk.runtime_risk
+        - 1.0 * risk.conflict_risk
+        - 0.6 * risk.test_risk
+        - 0.03 * diff.files_touched
+        - 0.001 * _candidate_diff_lines(candidate)
+        - 0.05 * _IMPACT_PRIORITY[candidate.boundary_impact.impact_level]
+    )
 
 
 def _is_high_risk(candidate: Candidate) -> bool:
@@ -181,13 +205,56 @@ def _filter_candidates(candidates: Iterable[Candidate], mode: PlanMode) -> tuple
     if mode == "report":
         return eligible, excluded
 
+    pending = list(eligible)
     selected: list[Candidate] = []
     selected_ids: set[str] = set()
     selected_files: set[str] = set()
     diff_lines_used = 0
     guarded_count = 0
     high_risk_count = 0
-    for candidate in eligible:
+
+    while pending:
+        feasible: list[Candidate] = []
+        for candidate in pending:
+            reason = _batch_selection_reason(
+                candidate,
+                mode=mode,
+                selected=selected,
+                selected_ids=selected_ids,
+                selected_files=selected_files,
+                diff_lines_used=diff_lines_used,
+                guarded_count=guarded_count,
+                high_risk_count=high_risk_count,
+            )
+            if reason is None:
+                feasible.append(candidate)
+
+        if not feasible:
+            break
+
+        def selection_score(candidate: Candidate) -> float:
+            synergy_bonus = 0.0
+            for current in selected:
+                if _is_duplicate_extract_synergy(candidate, current):
+                    synergy_bonus += 0.18
+                if _is_duplicate_remove_abstraction_synergy(candidate, current):
+                    synergy_bonus += 0.16
+                if _is_cycle_split_synergy(candidate, current):
+                    synergy_bonus += 0.14
+            return _candidate_score(candidate) + synergy_bonus
+
+        best = sorted(feasible, key=lambda candidate: (-selection_score(candidate), _ranking_key(candidate)))[0]
+        pending.remove(best)
+        selected.append(best)
+        selected_ids.add(best.id)
+        selected_files.update(best.files)
+        diff_lines_used += _candidate_diff_lines(best)
+        if best.apply_mode_hint == "guarded":
+            guarded_count += 1
+        if _is_high_risk(best):
+            high_risk_count += 1
+
+    for candidate in pending:
         reason = _batch_selection_reason(
             candidate,
             mode=mode,
@@ -198,17 +265,7 @@ def _filter_candidates(candidates: Iterable[Candidate], mode: PlanMode) -> tuple
             guarded_count=guarded_count,
             high_risk_count=high_risk_count,
         )
-        if reason is not None:
-            excluded.append(ExcludedCandidate(candidate=candidate, reason=reason))
-            continue
-        selected.append(candidate)
-        selected_ids.add(candidate.id)
-        selected_files.update(candidate.files)
-        diff_lines_used += _candidate_diff_lines(candidate)
-        if candidate.apply_mode_hint == "guarded":
-            guarded_count += 1
-        if _is_high_risk(candidate):
-            high_risk_count += 1
+        excluded.append(ExcludedCandidate(candidate=candidate, reason=reason or f"{mode} batch could not place candidate"))
     return selected, excluded
 
 

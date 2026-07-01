@@ -41,6 +41,7 @@ def _candidate(
     impact_level: str = "none",
     required_checks: list[str] | None = None,
     cross_language: bool = False,
+    contract_artifacts: list[str] | None = None,
     provenance_detectors: list[str] | None = None,
     dependencies: list[str] | None = None,
     conflicts: list[str] | None = None,
@@ -76,6 +77,7 @@ def _candidate(
             "boundaryImpact": {
                 "crossLanguage": cross_language,
                 "impactLevel": impact_level,
+                "contractArtifacts": contract_artifacts or [],
             },
             "confidence": confidence,
             "applyModeHint": apply_mode_hint,
@@ -103,6 +105,42 @@ def test_safe_mode_filters_to_low_risk_auto_candidates() -> None:
     assert result.required_checks == ["parse", "lint"]
 
 
+def test_balanced_mode_retries_candidates_when_dependency_becomes_satisfied() -> None:
+    dependent = Candidate.model_validate(
+        {
+            **_candidate(
+                "dependent-first",
+                files=["src/dependent.py"],
+                symbols=["shared_helper"],
+                confidence=0.95,
+                maintainability_gain=0.4,
+            ).model_dump(by_alias=True),
+            "dependencies": ["dependency-second"],
+        }
+    )
+    dependency = Candidate.model_validate(
+        {
+            **_candidate(
+                "dependency-second",
+                files=["src/provider.py"],
+                symbols=["provider_helper"],
+                confidence=0.6,
+                maintainability_gain=0.05,
+            ).model_dump(by_alias=True),
+        }
+    )
+
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[dependent, dependency],
+    )
+
+    assert [candidate.id for candidate in result.selected_candidates] == ["dependency-second", "dependent-first"]
+
+
+
 def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
     guarded_cross_language = Candidate.model_validate(
         {
@@ -113,6 +151,7 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
                 impact_level="low",
                 files=["backend/api.py"],
                 symbols=["very_long_function"],
+                contract_artifacts=["openapi.yaml"],
             ).model_dump(by_alias=True),
             "kind": "extract_function",
             "scope": "module",
@@ -121,7 +160,7 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
     candidates = [
         _candidate("auto-ok"),
         _candidate("guarded-ok", apply_mode_hint="guarded", files=["src/guarded.py"], symbols=["guarded_symbol"]),
-        _candidate("cross-language-low", cross_language=True, impact_level="low", files=["frontend/client.ts"]),
+        _candidate("cross-language-low", cross_language=True, impact_level="low", files=["frontend/client.ts"], contract_artifacts=["openapi.yaml"]),
         guarded_cross_language,
         _candidate("cross-language-medium", cross_language=True, impact_level="medium", files=["backend/api.py"]),
         _candidate("report-only", apply_mode_hint="report_only"),
@@ -134,11 +173,11 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
 
     result = build_plan(mode="balanced", repo=_repo_snapshot(), adapter_names=["python"], candidates=candidates)
 
-    assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "cross-language-low", "guarded-ok", "guarded-cross-language-low"]
+    assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "guarded-ok", "cross-language-low", "guarded-cross-language-low"]
     excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
     assert (
         excluded["cross-language-medium"]
-        == "cross-language candidate requires lower boundary impact before balanced execution"
+        == "cross-language candidate requires explicit boundary contract artifacts before balanced execution"
     )
     assert excluded["report-only"] == "report-only candidate retained as explanatory exclusion"
     assert (

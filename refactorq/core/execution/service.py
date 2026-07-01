@@ -446,6 +446,8 @@ def apply_plan(root: Path, plan: PlanResult) -> ApplyResult:
 
 
 def _supports_candidate(root: Path, candidate: Candidate, guarded_applier: CodexGuardedApplier) -> bool:
+    if candidate.boundary_impact.cross_language and not candidate.boundary_impact.contract_artifacts:
+        return False
     if candidate.apply_mode_hint == "auto":
         return _auto_support_reason(root, candidate) is None
     if candidate.apply_mode_hint == "guarded":
