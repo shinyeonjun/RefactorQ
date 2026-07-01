@@ -4,6 +4,7 @@ import atexit
 import json
 import shutil
 import stat
+import subprocess
 import tempfile
 import zipfile
 from collections.abc import Callable
@@ -26,17 +27,20 @@ class NormalizedRepoSource:
     original: str
     analysis_root: Path
     kind: str
+    mutable: bool = False
+    preserved: bool = False
 
 
 @contextmanager
-def normalize_repo_source(source: str | Path) -> Iterator[NormalizedRepoSource]:
+def normalize_repo_source(source: str | Path, *, mutable: bool = False) -> Iterator[NormalizedRepoSource]:
     _drain_deferred_cleanup()
     if isinstance(source, Path):
-        yield NormalizedRepoSource(original=str(source), analysis_root=source.resolve(), kind="local")
+        yield NormalizedRepoSource(original=str(source), analysis_root=source.resolve(), kind="local", mutable=mutable)
         return
 
     if _is_github_repo_url(source):
-        with _normalize_github_repo_source(source) as repo_source:
+        normalizer = _normalize_github_mutable_repo_source if mutable else _normalize_github_repo_source
+        with normalizer(source) as repo_source:
             yield repo_source
         return
 
@@ -45,7 +49,7 @@ def normalize_repo_source(source: str | Path) -> Iterator[NormalizedRepoSource]:
         raise FileNotFoundError(source)
     if not local_path.is_dir():
         raise NotADirectoryError(source)
-    yield NormalizedRepoSource(original=source, analysis_root=local_path.resolve(), kind="local")
+    yield NormalizedRepoSource(original=source, analysis_root=local_path.resolve(), kind="local", mutable=mutable)
 
 
 @contextmanager
@@ -59,9 +63,27 @@ def _normalize_github_repo_source(source: str) -> Iterator[NormalizedRepoSource]
         extract_path.mkdir()
         analysis_root = _extract_archive(archive_path, extract_path)
         _mark_read_only(analysis_root)
-        yield NormalizedRepoSource(original=source, analysis_root=analysis_root, kind="github")
+        yield NormalizedRepoSource(original=source, analysis_root=analysis_root, kind="github", mutable=False)
     finally:
         _cleanup_now_or_defer(temp_root)
+
+
+@contextmanager
+def _normalize_github_mutable_repo_source(source: str) -> Iterator[NormalizedRepoSource]:
+    temp_root = Path(tempfile.mkdtemp(prefix="refactorq-repo-clone-"))
+    clone_root = temp_root / "repo"
+    try:
+        _clone_github_repo(source, clone_root)
+        yield NormalizedRepoSource(
+            original=source,
+            analysis_root=clone_root,
+            kind="github_clone",
+            mutable=True,
+            preserved=True,
+        )
+    except Exception:
+        _cleanup_now_or_defer(temp_root)
+        raise
 
 
 def _is_github_repo_url(source: str) -> bool:
@@ -110,6 +132,22 @@ def _fetch_json(url: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError(f"Unexpected JSON payload from {url}")
     return payload
+
+
+def _clone_github_repo(source: str, destination: Path) -> Path:
+    completed = subprocess.run(
+        ["git", "clone", "--depth", "1", source, str(destination)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        detail = stderr or stdout or "git clone failed"
+        raise RuntimeError(f"Failed to clone GitHub repository {source}: {detail}")
+    return destination
 
 
 def _download_file(url: str, destination: Path) -> Path:

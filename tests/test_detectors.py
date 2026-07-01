@@ -50,6 +50,17 @@ def test_python_adapter_detects_large_module_candidate(tmp_path: Path) -> None:
     assert any(candidate.kind == "split_large_module" and candidate.files == ["large_module.py"] for candidate in candidates)
 
 
+def test_python_adapter_skips_init_reexport_imports(tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("from .service import Api\n", encoding="utf-8")
+    (package / "service.py").write_text("class Api:\n    pass\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert not any(candidate.kind == "unused_import" and candidate.files == ["pkg/__init__.py"] for candidate in candidates)
+
+
 def test_python_adapter_detects_layer_violation_candidate(tmp_path: Path) -> None:
     backend = tmp_path / "backend"
     frontend = tmp_path / "frontend"

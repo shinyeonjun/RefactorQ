@@ -41,6 +41,8 @@ class ApplyResult(BaseModel):
     repo: RepoSnapshot
     plan: PlanResult
     status: ApplyStatus
+    source_kind: str = Field(default="local", alias="sourceKind")
+    working_root: str | None = Field(default=None, alias="workingRoot")
     applied_candidates: list[Candidate] = Field(default_factory=list, alias="appliedCandidates")
     skipped_candidates: list[ExecutionCandidateNote] = Field(default_factory=list, alias="skippedCandidates")
     changed_files: list[str] = Field(default_factory=list, alias="changedFiles")
@@ -76,6 +78,8 @@ class RunResult(BaseModel):
     mode: PlanMode
     repo: RepoSnapshot
     plan: PlanResult
+    source_kind: str = Field(default="local", alias="sourceKind")
+    working_root: str | None = Field(default=None, alias="workingRoot")
     apply: ApplyResult
     verification: VerificationResult
     status: RunStatus

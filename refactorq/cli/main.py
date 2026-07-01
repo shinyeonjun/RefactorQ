@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -37,11 +36,11 @@ def plan(
 
 @app.command()
 def apply(
-    repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
+    repo: str = typer.Argument(...),
     mode: PlanMode = typer.Option("safe", "--mode"),
 ) -> None:
     """Apply deterministic low-risk refactors for the selected plan."""
-    result = service.apply(repo, mode)
+    result = service.apply_source(repo, mode)
     _emit_json(result.model_dump(by_alias=True))
 
 
@@ -64,11 +63,11 @@ def report(
 
 @app.command(name="run")
 def run_pipeline(
-    repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
+    repo: str = typer.Argument(...),
     mode: PlanMode = typer.Option("safe", "--mode"),
 ) -> None:
     """Plan, apply deterministic refactors, verify, and roll back on failure."""
-    result = service.run(repo, mode)
+    result = service.run_source(repo, mode)
     _emit_json(result.model_dump(by_alias=True))
 
 

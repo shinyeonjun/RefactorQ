@@ -10,7 +10,7 @@ from refactorq.core.execution import ApplyResult, ReportResult, RunResult, apply
 from refactorq.core.planning import PlanMode, PlanResult, build_plan
 from refactorq.core.boundary import enrich_boundary_candidates
 from refactorq.core.repo import RepoSnapshot, detect_repo
-from refactorq.core.repo_source import normalize_repo_source
+from refactorq.core.repo_source import NormalizedRepoSource, normalize_repo_source
 from refactorq.core.verification import VerificationResult
 from refactorq.core.verification.service import verify_repo
 
@@ -19,6 +19,30 @@ class ScanResult(BaseModel):
     repo: RepoSnapshot
     adapter_names: list[str] = Field(default_factory=list, alias="adapterNames")
     candidates: list[Candidate] = Field(default_factory=list)
+
+
+def _apply_source_metadata_apply(result: ApplyResult, repo_source: NormalizedRepoSource) -> ApplyResult:
+    return result.model_copy(
+        update={
+            "source_kind": repo_source.kind,
+            "working_root": str(repo_source.analysis_root),
+        }
+    )
+
+
+def _apply_source_metadata_run(result: RunResult, repo_source: NormalizedRepoSource) -> RunResult:
+    return result.model_copy(
+        update={
+            "source_kind": repo_source.kind,
+            "working_root": str(repo_source.analysis_root),
+            "apply": result.apply.model_copy(
+                update={
+                    "source_kind": repo_source.kind,
+                    "working_root": str(repo_source.analysis_root),
+                }
+            ),
+        }
+    )
 
 
 class RefactorQService:
@@ -52,6 +76,10 @@ class RefactorQService:
             candidates=scan_result.candidates,
         )
 
+    def apply_source(self, source: str | Path, mode: PlanMode) -> ApplyResult:
+        with normalize_repo_source(source, mutable=True) as repo_source:
+            return _apply_source_metadata_apply(self.apply(repo_source.analysis_root, mode), repo_source)
+
     def apply(self, root: Path, mode: PlanMode) -> ApplyResult:
         return apply_plan(root, self.plan(root, mode))
 
@@ -68,6 +96,10 @@ class RefactorQService:
 
     def report(self, root: Path, mode: PlanMode) -> ReportResult:
         return report_plan(root, self.plan(root, mode))
+
+    def run_source(self, source: str | Path, mode: PlanMode) -> RunResult:
+        with normalize_repo_source(source, mutable=True) as repo_source:
+            return _apply_source_metadata_run(self.run(repo_source.analysis_root, mode), repo_source)
 
     def run(self, root: Path, mode: PlanMode) -> RunResult:
         return run_plan(root, self.plan(root, mode))

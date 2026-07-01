@@ -15,6 +15,10 @@ from .models import VerificationCheckResult, VerificationKind, VerificationResul
 _COMMAND_TIMEOUT_SECONDS = 120
 
 
+def _npm_command() -> str:
+    return "npm.cmd" if sys.platform == "win32" else "npm"
+
+
 def _verify_python_parse(root: Path) -> VerificationCheckResult:
     errors: list[str] = []
     file_count = 0
@@ -252,7 +256,7 @@ def _package_script_checks(root: Path) -> list[VerificationCheckResult]:
         if script_name is None:
             continue
         checks.append(
-            _run_command_check(root, name=name, kind=kind, command=["npm", "run", script_name])
+            _run_command_check(root, name=name, kind=kind, command=[_npm_command(), "run", script_name])
         )
     return checks
 

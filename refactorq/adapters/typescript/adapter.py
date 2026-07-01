@@ -153,6 +153,7 @@ class TypeScriptAdapter:
     def _invoke_worker(self, request: WorkerProtocolRequest) -> object:
         completed = subprocess.run(
             self._worker_command(),
+            cwd=self._worker_root(),
             input=request.model_dump_json(by_alias=True),
             capture_output=True,
             text=True,
@@ -162,8 +163,11 @@ class TypeScriptAdapter:
         )
         return json.loads(completed.stdout)
 
+    def _worker_root(self) -> Path:
+        return Path(__file__).resolve().parents[3] / "workers" / "ts-adapter"
+
     def _worker_command(self) -> list[str]:
-        worker_root = Path(__file__).resolve().parents[3] / "workers" / "ts-adapter"
+        worker_root = self._worker_root()
         source_worker = worker_root / "src" / "index.ts"
         if source_worker.exists():
             return ["node", "--experimental-strip-types", str(source_worker)]

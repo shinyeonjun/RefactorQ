@@ -13,6 +13,7 @@ from refactorq.core.repo import RepoManifestMap, RepoSnapshot, detect_repo
 from refactorq.core.repo_source import normalize_repo_source
 from refactorq.core.service import RefactorQService
 from refactorq.core.verification import VerificationResult
+from refactorq.core.execution import ApplyResult
 import refactorq.core.repo_source.source as repo_source_module
 import refactorq.core.service as service_module
 
@@ -83,6 +84,26 @@ def test_normalize_repo_source_expands_github_archives(monkeypatch: MonkeyPatch)
     assert isinstance(calls["cleanup"], Path)
 
 
+def test_normalize_repo_source_clones_github_repos_for_mutation(monkeypatch: MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_clone(source: str, destination: Path) -> Path:
+        calls["source"] = source
+        destination.mkdir(parents=True)
+        (destination / ".git").mkdir()
+        return destination
+
+    monkeypatch.setattr(repo_source_module, "_clone_github_repo", fake_clone)
+
+    with normalize_repo_source("https://github.com/acme/project", mutable=True) as repo_source:
+        assert repo_source.kind == "github_clone"
+        assert repo_source.mutable is True
+        assert repo_source.preserved is True
+        assert repo_source.analysis_root.name == "repo"
+
+    assert calls["source"] == "https://github.com/acme/project"
+
+
 def test_service_scan_exposes_adapter_names() -> None:
     result = RefactorQService().scan(Path("."))
     assert "python" in result.adapter_names
@@ -145,6 +166,25 @@ def test_plan_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path
     assert 'selectedCandidates' in result.stdout
 
 
+def test_service_apply_source_uses_mutable_repo_source(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    @contextmanager
+    def fake_normalize(source: str | Path, *, mutable: bool = False) -> Iterator[SimpleNamespace]:
+        calls["source"] = source
+        calls["mutable"] = mutable
+        yield SimpleNamespace(analysis_root=tmp_path, kind="github_clone")
+
+    monkeypatch.setattr(service_module, "normalize_repo_source", fake_normalize)
+    monkeypatch.setattr(service_module, "apply_plan", lambda root, plan: ApplyResult(mode="safe", repo=_repo_snapshot(root), plan=plan, status="no_changes", appliedCandidates=[], skippedCandidates=[], changedFiles=[]))
+
+    result = RefactorQService().apply_source("https://github.com/acme/project", "safe")
+
+    assert calls == {"source": "https://github.com/acme/project", "mutable": True}
+    assert result.source_kind == "github_clone"
+    assert result.working_root == str(tmp_path)
+
+
 def test_verify_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 
@@ -161,6 +201,26 @@ def test_verify_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_pa
     assert result.exit_code == 0, result.stdout
     assert calls["source"] == "https://github.com/acme/project"
     assert '"status": "passed"' in result.stdout
+
+
+def test_apply_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+
+    @contextmanager
+    def fake_normalize(source: str | Path, *, mutable: bool = False) -> Iterator[SimpleNamespace]:
+        calls["source"] = source
+        calls["mutable"] = mutable
+        yield SimpleNamespace(analysis_root=tmp_path, kind="github_clone")
+
+    monkeypatch.setattr(service_module, "normalize_repo_source", fake_normalize)
+    monkeypatch.setattr(service_module, "detect_repo", _repo_snapshot)
+    monkeypatch.setattr(service_module, "detect_adapters", lambda root: [])
+
+    result = runner.invoke(app, ["apply", "https://github.com/acme/project"])
+
+    assert result.exit_code == 0, result.stdout
+    assert calls == {"source": "https://github.com/acme/project", "mutable": True}
+    assert '"sourceKind": "github_clone"' in result.stdout
 
 
 def test_report_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
@@ -180,6 +240,27 @@ def test_report_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_pa
     assert result.exit_code == 0, result.stdout
     assert calls["source"] == "https://github.com/acme/project"
     assert '"executionSupport"' in result.stdout
+
+def test_run_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+
+    @contextmanager
+    def fake_normalize(source: str | Path, *, mutable: bool = False) -> Iterator[SimpleNamespace]:
+        calls["source"] = source
+        calls["mutable"] = mutable
+        yield SimpleNamespace(analysis_root=tmp_path, kind="github_clone")
+
+    monkeypatch.setattr(service_module, "normalize_repo_source", fake_normalize)
+    monkeypatch.setattr(service_module, "detect_repo", _repo_snapshot)
+    monkeypatch.setattr(service_module, "detect_adapters", lambda root: [])
+    monkeypatch.setattr(service_module, "verify_repo", lambda root: VerificationResult(status="passed", checks=[]))
+
+    result = runner.invoke(app, ["run", "https://github.com/acme/project"])
+
+    assert result.exit_code == 0, result.stdout
+    assert calls == {"source": "https://github.com/acme/project", "mutable": True}
+    assert '"sourceKind": "github_clone"' in result.stdout
+
 
 def test_deferred_cleanup_runs_on_next_normalization(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     deferred_record = tmp_path / "cleanup.json"

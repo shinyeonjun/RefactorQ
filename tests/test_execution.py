@@ -13,6 +13,7 @@ from refactorq.cli.main import app
 from refactorq.core.candidate import Candidate
 from refactorq.core.service import RefactorQService
 from refactorq.core.verification import VerificationCheckResult, VerificationResult
+from refactorq.core.verification.service import _npm_command
 
 runner = CliRunner()
 
@@ -551,7 +552,7 @@ def test_verify_runs_typescript_package_scripts(tmp_path: Path, monkeypatch: Mon
     assert result.status == "passed"
     assert any(check.name == "typescript_typecheck" for check in result.checks)
     assert any(check.name == "typescript_build" for check in result.checks)
-    assert commands == [["npm", "run", "ts:check"], ["npm", "run", "ts:build"]]
+    assert commands == [[_npm_command(), "run", "ts:check"], [_npm_command(), "run", "ts:build"]]
 
 def test_apply_command_emits_real_execution_payload(tmp_path: Path) -> None:
     sample = tmp_path / "sample.py"

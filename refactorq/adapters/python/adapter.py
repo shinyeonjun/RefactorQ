@@ -461,6 +461,8 @@ class PythonAdapter:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for alias in node.names:
                     bound_name = alias.asname or alias.name.split(".")[0]
+                    if is_package:
+                        continue
                     if bound_name in referenced_names:
                         continue
                     candidates.append(
