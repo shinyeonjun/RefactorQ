@@ -11,11 +11,29 @@ from refactorq.core.verification import VerificationResult
 
 ApplyStatus = Literal["applied", "no_changes"]
 RunStatus = Literal["passed", "rolled_back", "no_changes"]
+RepairStatus = Literal["not_needed", "repaired", "failed", "skipped"]
 
 
 class ExecutionCandidateNote(BaseModel):
     candidate: Candidate
     reason: str
+
+
+class GitExecutionResult(BaseModel):
+    enabled: bool
+    available: bool
+    clean: bool
+    base_branch: str | None = Field(default=None, alias="baseBranch")
+    execution_branch: str | None = Field(default=None, alias="executionBranch")
+    commit_sha: str | None = Field(default=None, alias="commitSha")
+    reason: str | None = None
+
+
+class RepairResult(BaseModel):
+    status: RepairStatus
+    attempted: bool
+    touched_files: list[str] = Field(default_factory=list, alias="touchedFiles")
+    reason: str | None = None
 
 
 class ApplyResult(BaseModel):
@@ -30,8 +48,12 @@ class ApplyResult(BaseModel):
 
 class ExecutionSupportSummary(BaseModel):
     supported_candidates: int = Field(alias="supportedCandidates")
+    supported_auto_candidates: int = Field(alias="supportedAutoCandidates")
+    supported_guarded_candidates: int = Field(alias="supportedGuardedCandidates")
     unsupported_candidates: int = Field(alias="unsupportedCandidates")
     applied_candidate_kinds: list[str] = Field(default_factory=list, alias="appliedCandidateKinds")
+    git_branching_supported: bool = Field(alias="gitBranchingSupported")
+    git_reason: str | None = Field(default=None, alias="gitReason")
 
 
 class ReportResult(BaseModel):
@@ -49,3 +71,5 @@ class RunResult(BaseModel):
     verification: VerificationResult
     status: RunStatus
     rollback_applied: bool = Field(alias="rollbackApplied")
+    repair: RepairResult
+    git: GitExecutionResult

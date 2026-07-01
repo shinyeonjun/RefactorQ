@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
 from refactorq.agents.codex import CodexGuardedApplier, GuardedApplyResult
-from refactorq.core.candidate import Candidate
 from refactorq.cli.main import app
+from refactorq.core.candidate import Candidate
 from refactorq.core.service import RefactorQService
 from refactorq.core.verification import VerificationCheckResult, VerificationResult
-
 
 runner = CliRunner()
 
@@ -22,6 +22,18 @@ def _long_python_function() -> str:
     body.append("    return value_39")
     body.append("")
     return "\n".join(body)
+
+
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
 
 
 
@@ -149,11 +161,12 @@ def test_run_rolls_back_when_verification_fails(tmp_path: Path, monkeypatch: Mon
 
     assert result.status == "rolled_back"
     assert result.rollback_applied is True
+    assert result.repair.status == "not_needed"
     assert sample.read_text(encoding="utf-8") == original
 
 
 
-def test_run_rolls_back_guarded_changes_on_real_parse_failure(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_run_repairs_guarded_changes_before_succeeding(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "sample.py"
     original = _long_python_function()
     sample.write_text(original, encoding="utf-8")
@@ -169,13 +182,91 @@ def test_run_rolls_back_guarded_changes_on_real_parse_failure(tmp_path: Path, mo
             details={},
         )
 
+    def fake_repair(
+        self: CodexGuardedApplier,
+        root: Path,
+        candidates: list[Candidate],
+        verification: VerificationResult,
+    ) -> GuardedApplyResult:
+        (root / candidates[0].files[0]).write_text(
+            "def _very_long_function_impl():\n    return 39\n\n\ndef very_long_function():\n    return _very_long_function_impl()\n",
+            encoding="utf-8",
+        )
+        return GuardedApplyResult(
+            status="applied",
+            touchedFiles=[candidates[0].files[0]],
+            summary=["repaired syntax"],
+            details={"failure": verification.checks[0].name},
+        )
+
     monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.repair", fake_repair)
+
+    result = RefactorQService().run(tmp_path, "balanced")
+
+    assert result.status == "passed"
+    assert result.rollback_applied is False
+    assert result.repair.status == "repaired"
+    assert result.repair.attempted is True
+    assert "_very_long_function_impl" in sample.read_text(encoding="utf-8")
+
+
+
+def test_run_rolls_back_guarded_changes_when_repair_cannot_fix(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.py"
+    original = _long_python_function()
+    sample.write_text(original, encoding="utf-8")
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.is_available", lambda self: True)
+
+    def fake_apply(self: CodexGuardedApplier, root: Path, candidate: Candidate) -> GuardedApplyResult:
+        (root / candidate.files[0]).write_text("def very_long_function(:\n    pass\n", encoding="utf-8")
+        return GuardedApplyResult(
+            status="applied",
+            touchedFiles=[candidate.files[0]],
+            summary=["broke syntax"],
+            details={},
+        )
+
+    def fake_repair(
+        self: CodexGuardedApplier,
+        root: Path,
+        candidates: list[Candidate],
+        verification: VerificationResult,
+    ) -> GuardedApplyResult:
+        return GuardedApplyResult(status="no_change", touchedFiles=[], summary=["could not repair"], details={})
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.repair", fake_repair)
 
     result = RefactorQService().run(tmp_path, "balanced")
 
     assert result.status == "rolled_back"
     assert result.rollback_applied is True
+    assert result.repair.status == "skipped"
+    assert result.repair.reason == "could not repair"
     assert sample.read_text(encoding="utf-8") == original
+
+
+
+def test_run_creates_git_branch_and_commit_when_workspace_is_clean(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("import os\n\nprint('hi')\n", encoding="utf-8")
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.name", "RefactorQ Test")
+    _git(tmp_path, "config", "user.email", "refactorq@example.com")
+    _git(tmp_path, "add", "sample.py")
+    _git(tmp_path, "commit", "-m", "baseline")
+
+    result = RefactorQService().run(tmp_path, "safe")
+
+    assert result.status == "passed"
+    assert result.git.enabled is True
+    assert result.git.execution_branch is not None
+    assert result.git.execution_branch.startswith("refactorq/safe-")
+    assert result.git.commit_sha is not None
+    assert _git(tmp_path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == result.git.execution_branch
+    assert _git(tmp_path, "show", "--stat", "--oneline", "-1").stdout.startswith(result.git.commit_sha[:7])
 
 
 
@@ -186,8 +277,11 @@ def test_report_summarizes_supported_execution_candidates(tmp_path: Path) -> Non
     result = RefactorQService().report(tmp_path, "report")
 
     assert result.execution_support.supported_candidates == 1
+    assert result.execution_support.supported_auto_candidates == 1
+    assert result.execution_support.supported_guarded_candidates == 0
     assert result.execution_support.unsupported_candidates == 0
     assert result.execution_support.applied_candidate_kinds == ["unused_import"]
+    assert result.execution_support.git_branching_supported is False
 
 
 

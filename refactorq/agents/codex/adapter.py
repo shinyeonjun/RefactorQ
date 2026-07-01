@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from refactorq.core.candidate import Candidate
+from refactorq.core.verification import VerificationResult
 
 from .models import GuardedApplyResult
 
@@ -55,13 +56,23 @@ class CodexGuardedApplier:
         support_reason = self.support_reason(root, candidate)
         if support_reason is not None:
             return GuardedApplyResult(status="unsupported", summary=[support_reason], details={"reason": support_reason})
+        prompt = self._build_apply_prompt(candidate)
+        return self._run(root, prompt)
 
+    def repair(self, root: Path, candidates: list[Candidate], verification: VerificationResult) -> GuardedApplyResult:
+        if not candidates:
+            return GuardedApplyResult(status="unsupported", summary=["no guarded candidates available for repair"], details={})
+        if not self.is_available():
+            return GuardedApplyResult(status="unsupported", summary=["codex cli is not available"], details={})
+        prompt = self._build_repair_prompt(candidates, verification)
+        return self._run(root, prompt)
+
+    def _run(self, root: Path, prompt: str) -> GuardedApplyResult:
         with tempfile.TemporaryDirectory(prefix="refactorq-codex-") as temp_dir:
             temp_root = Path(temp_dir)
             schema_path = temp_root / "codex-output-schema.json"
             output_path = temp_root / "codex-output.json"
             schema_path.write_text(json.dumps(_OUTPUT_SCHEMA), encoding="utf-8")
-            prompt = self._build_prompt(candidate)
             subprocess.run(
                 [
                     "codex",
@@ -89,7 +100,7 @@ class CodexGuardedApplier:
             payload = json.loads(output_path.read_text(encoding="utf-8"))
         return GuardedApplyResult.model_validate(payload)
 
-    def _build_prompt(self, candidate: Candidate) -> str:
+    def _build_apply_prompt(self, candidate: Candidate) -> str:
         region = candidate.anchor_regions[0]
         required_checks = ", ".join(candidate.required_checks) if candidate.required_checks else "none"
         return (
@@ -109,4 +120,28 @@ class CodexGuardedApplier:
             "Preferred implementation: extract a small private helper or equivalent local refactor so the"
             " target function becomes shorter and clearer without changing behavior.\n\n"
             "Return JSON matching the provided schema with touchedFiles, summary, and details.\n"
+        )
+
+    def _build_repair_prompt(self, candidates: list[Candidate], verification: VerificationResult) -> str:
+        allowed_files = sorted({file for candidate in candidates for file in candidate.files})
+        evidence: list[str] = []
+        for check in verification.checks:
+            if check.status == "failed":
+                evidence.append(f"{check.name}: {' | '.join(check.evidence[:5])}")
+        candidate_lines = [
+            f"- {candidate.id}: {candidate.kind} in {candidate.files[0]} ({candidate.title})"
+            for candidate in candidates
+        ]
+        return (
+            "You are repairing a previously applied guarded refactor after verification failed.\n"
+            "Modify only the allowed files and keep the original refactoring intent.\n"
+            "Do not broaden scope, touch tests, configs, docs, or unrelated files.\n"
+            "If safe repair is not possible, make no changes and return status no_change.\n\n"
+            f"Allowed files: {', '.join(allowed_files)}\n"
+            "Guarded candidates:\n"
+            + "\n".join(candidate_lines)
+            + "\n\n"
+            + "Verification failures:\n"
+            + ("\n".join(evidence) if evidence else "- verification failed without detailed evidence")
+            + "\n\nReturn JSON matching the provided schema with touchedFiles, summary, and details.\n"
         )

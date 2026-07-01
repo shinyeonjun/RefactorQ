@@ -10,11 +10,26 @@ from pydantic import ValidationError
 from refactorq.agents.codex import CodexGuardedApplier
 from refactorq.core.candidate import Candidate
 from refactorq.core.filesystem import walk_repo_files
+from refactorq.core.git_execution import (
+    GitExecutionContext,
+    begin_git_execution,
+    finalize_git_execution,
+    inspect_git_workspace,
+    abort_git_execution,
+)
 from refactorq.core.planning import PlanResult
 from refactorq.core.verification import VerificationResult
 from refactorq.core.verification.service import verify_repo
 
-from .models import ApplyResult, ExecutionCandidateNote, ExecutionSupportSummary, ReportResult, RunResult
+from .models import (
+    ApplyResult,
+    ExecutionCandidateNote,
+    ExecutionSupportSummary,
+    GitExecutionResult,
+    RepairResult,
+    ReportResult,
+    RunResult,
+)
 
 _IMPORT_PREFIXES = ("import ", "from ")
 _TS_IMPORT_PATTERN = re.compile(
@@ -24,6 +39,12 @@ _TS_IMPORT_PATTERN = re.compile(
 
 class _ApplyInternalResult(ApplyResult):
     original_snapshot: dict[str, bytes] = {}
+
+
+class _RepairAttempt:
+    def __init__(self, result: RepairResult, repaired: bool) -> None:
+        self.result = result
+        self.repaired = repaired
 
 
 def _candidate_line_number(candidate: Candidate) -> int:
@@ -190,11 +211,7 @@ def _snapshot_repo(root: Path) -> dict[str, bytes]:
 
 
 def _changed_paths(before: dict[str, bytes], after: dict[str, bytes]) -> list[str]:
-    changed: list[str] = []
-    for rel_path in sorted(set(before) | set(after)):
-        if before.get(rel_path) != after.get(rel_path):
-            changed.append(rel_path)
-    return changed
+    return [rel_path for rel_path in sorted(set(before) | set(after)) if before.get(rel_path) != after.get(rel_path)]
 
 
 def _restore_snapshot(root: Path, snapshot: dict[str, bytes]) -> bool:
@@ -234,11 +251,7 @@ def _guarded_failure_reason(error: Exception) -> str:
     return f"Codex guarded execution failed: {error}"
 
 
-def _apply_guarded_candidate(
-    root: Path,
-    candidate: Candidate,
-    guarded_applier: CodexGuardedApplier,
-) -> tuple[bool, str | None]:
+def _apply_guarded_candidate(root: Path, candidate: Candidate, guarded_applier: CodexGuardedApplier) -> tuple[bool, str | None]:
     support_reason = guarded_applier.support_reason(root, candidate)
     if support_reason is not None:
         return False, support_reason
@@ -246,7 +259,7 @@ def _apply_guarded_candidate(
     before = _snapshot_repo(root)
     try:
         result = guarded_applier.apply(root, candidate)
-    except Exception as exc:  # pragma: no cover - exercised through failure handling tests
+    except Exception as exc:  # pragma: no cover
         _restore_snapshot(root, before)
         return False, _guarded_failure_reason(exc)
 
@@ -271,6 +284,89 @@ def _apply_guarded_candidate(
     if not changed_paths:
         return False, "guarded Codex flow produced no file changes"
     return True, None
+
+
+def _repair_guarded_changes(
+    root: Path,
+    guarded_candidates: list[Candidate],
+    verification: VerificationResult,
+    guarded_applier: CodexGuardedApplier,
+) -> _RepairAttempt:
+    if not guarded_candidates:
+        return _RepairAttempt(RepairResult(status="not_needed", attempted=False, touchedFiles=[]), repaired=False)
+    if not guarded_applier.is_available():
+        return _RepairAttempt(
+            RepairResult(status="skipped", attempted=False, touchedFiles=[], reason="codex cli is not available"),
+            repaired=False,
+        )
+
+    before = _snapshot_repo(root)
+    allowed_files = {file for candidate in guarded_candidates for file in candidate.files}
+    try:
+        result = guarded_applier.repair(root, guarded_candidates, verification)
+    except Exception as exc:  # pragma: no cover
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(status="failed", attempted=True, touchedFiles=[], reason=_guarded_failure_reason(exc)),
+            repaired=False,
+        )
+
+    after = _snapshot_repo(root)
+    changed_paths = _changed_paths(before, after)
+    touched_files = set(result.touched_files)
+
+    if result.status == "unsupported":
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(
+                status="skipped",
+                attempted=True,
+                touchedFiles=[],
+                reason=result.summary[0] if result.summary else "guarded repair is unsupported",
+            ),
+            repaired=False,
+        )
+    if any(path not in allowed_files for path in changed_paths):
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(
+                status="failed",
+                attempted=True,
+                touchedFiles=changed_paths,
+                reason="guarded Codex repair touched files outside the allowed candidate scope",
+            ),
+            repaired=False,
+        )
+    if any(path not in allowed_files for path in touched_files):
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(
+                status="failed",
+                attempted=True,
+                touchedFiles=sorted(touched_files),
+                reason="guarded Codex repair declared files outside the allowed candidate scope",
+            ),
+            repaired=False,
+        )
+    if result.status == "no_change" and not changed_paths:
+        return _RepairAttempt(
+            RepairResult(
+                status="skipped",
+                attempted=True,
+                touchedFiles=[],
+                reason=result.summary[0] if result.summary else "guarded Codex repair made no changes",
+            ),
+            repaired=False,
+        )
+    if not changed_paths:
+        return _RepairAttempt(
+            RepairResult(status="skipped", attempted=True, touchedFiles=[], reason="guarded Codex repair made no changes"),
+            repaired=False,
+        )
+    return _RepairAttempt(
+        RepairResult(status="repaired", attempted=True, touchedFiles=changed_paths),
+        repaired=True,
+    )
 
 
 def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
@@ -341,13 +437,20 @@ def _supports_candidate(root: Path, candidate: Candidate, guarded_applier: Codex
 
 def report_plan(root: Path, plan: PlanResult) -> ReportResult:
     supported = 0
+    supported_auto = 0
+    supported_guarded = 0
     unsupported = 0
     kinds: set[str] = set()
     guarded_applier = CodexGuardedApplier()
+    git_state = inspect_git_workspace(root)
     for candidate in plan.selected_candidates:
         if _supports_candidate(root, candidate, guarded_applier):
             supported += 1
             kinds.add(candidate.kind)
+            if candidate.apply_mode_hint == "auto":
+                supported_auto += 1
+            elif candidate.apply_mode_hint == "guarded":
+                supported_guarded += 1
         else:
             unsupported += 1
     return ReportResult(
@@ -356,17 +459,46 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
         plan=plan,
         executionSupport=ExecutionSupportSummary(
             supportedCandidates=supported,
+            supportedAutoCandidates=supported_auto,
+            supportedGuardedCandidates=supported_guarded,
             unsupportedCandidates=unsupported,
             appliedCandidateKinds=sorted(kinds),
+            gitBranchingSupported=git_state.available and git_state.clean,
+            gitReason=git_state.reason,
         ),
     )
 
 
+def _initial_git_result(root: Path) -> GitExecutionResult:
+    state = inspect_git_workspace(root)
+    return GitExecutionResult(
+        enabled=state.available and state.clean,
+        available=state.available,
+        clean=state.clean,
+        baseBranch=state.base_branch,
+        reason=state.reason,
+    )
+
+
+def _abort_branch_if_needed(root: Path, context: GitExecutionContext | None) -> None:
+    if context is None:
+        return
+    abort_git_execution(root, context)
+
+
 def run_plan(root: Path, plan: PlanResult) -> RunResult:
+    git_result = _initial_git_result(root)
+    git_context = begin_git_execution(root, plan.mode) if git_result.enabled else None
+    if git_context is not None:
+        git_result.execution_branch = git_context.execution_branch
+
     apply_result = _apply_plan_internal(root, plan)
     verification: VerificationResult
     rollback_applied = False
+    repair_result = RepairResult(status="not_needed", attempted=False, touchedFiles=[])
+
     if apply_result.status == "no_changes":
+        _abort_branch_if_needed(root, git_context)
         verification = VerificationResult(status="passed", checks=[])
         return RunResult(
             mode=plan.mode,
@@ -376,11 +508,21 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
             verification=verification,
             status="no_changes",
             rollbackApplied=False,
+            repair=repair_result,
+            git=git_result,
         )
 
     verification = verify_repo(root)
+    guarded_candidates = [candidate for candidate in apply_result.applied_candidates if candidate.apply_mode_hint == "guarded"]
+    if verification.status == "failed":
+        repair_attempt = _repair_guarded_changes(root, guarded_candidates, verification, CodexGuardedApplier())
+        repair_result = repair_attempt.result
+        if repair_attempt.repaired:
+            verification = verify_repo(root)
+
     if verification.status == "failed":
         rollback_applied = _restore_snapshot(root, apply_result.original_snapshot)
+        _abort_branch_if_needed(root, git_context)
         return RunResult(
             mode=plan.mode,
             repo=plan.repo,
@@ -389,7 +531,35 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
             verification=verification,
             status="rolled_back",
             rollbackApplied=rollback_applied,
+            repair=repair_result,
+            git=git_result,
         )
+
+    if git_context is not None:
+        try:
+            git_result.commit_sha = finalize_git_execution(root, git_context, apply_result.changed_files, plan.mode)
+        except subprocess.CalledProcessError:
+            rollback_applied = _restore_snapshot(root, apply_result.original_snapshot)
+            _abort_branch_if_needed(root, git_context)
+            failed_verification = VerificationResult(status="failed", checks=[])
+            return RunResult(
+                mode=plan.mode,
+                repo=plan.repo,
+                plan=plan,
+                apply=ApplyResult.model_validate(apply_result.model_dump(by_alias=True)),
+                verification=failed_verification,
+                status="rolled_back",
+                rollbackApplied=rollback_applied,
+                repair=repair_result,
+                git=GitExecutionResult(
+                    enabled=git_result.enabled,
+                    available=git_result.available,
+                    clean=git_result.clean,
+                    baseBranch=git_result.base_branch,
+                    executionBranch=git_result.execution_branch,
+                    reason="git commit failed after successful verification",
+                ),
+            )
 
     return RunResult(
         mode=plan.mode,
@@ -399,4 +569,6 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
         verification=verification,
         status="passed",
         rollbackApplied=False,
+        repair=repair_result,
+        git=git_result,
     )
