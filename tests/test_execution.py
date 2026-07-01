@@ -175,7 +175,8 @@ def test_balanced_apply_uses_guarded_remove_abstraction_flow(tmp_path: Path, mon
     sample = tmp_path / "sample.py"
     sample.write_text(
         "def normalize(value):\n    return value.strip().lower()\n\n"
-        "def _normalize_wrapper(value):\n    return normalize(value)\n",
+        "def _normalize_wrapper(value):\n    return normalize(value)\n\n"
+        "print(_normalize_wrapper(\"ok\"))\n",
         encoding="utf-8",
     )
 

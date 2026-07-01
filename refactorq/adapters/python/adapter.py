@@ -19,6 +19,8 @@ LONG_FUNCTION_THRESHOLD = 35
 LARGE_MODULE_THRESHOLD = 300
 TOP_LEVEL_STATEMENT_THRESHOLD = 18
 DUPLICATE_FUNCTION_MIN_LINES = 3
+_CLIENT_LAYER_TOKENS = {"frontend", "client", "web", "ui"}
+_SERVER_LAYER_TOKENS = {"backend", "server", "api", "controller", "controllers"}
 
 
 def _region(file: str, start_line: int, end_line: int) -> AnchorRegion:
@@ -227,6 +229,15 @@ def _module_name(root: Path, path: Path) -> str:
     return ".".join(parts)
 
 
+def _path_layer(rel_path: str) -> str | None:
+    tokens = {part.lower() for part in Path(rel_path).parts}
+    if tokens & _CLIENT_LAYER_TOKENS:
+        return "client"
+    if tokens & _SERVER_LAYER_TOKENS:
+        return "server"
+    return None
+
+
 def _known_python_modules(root: Path) -> dict[str, str]:
     modules: dict[str, str] = {}
     for path in walk_source_files(root, (".py",)):
@@ -395,6 +406,7 @@ class PythonAdapter:
         is_package = path.name == "__init__.py"
         imports: set[str] = set()
         candidates: list[Candidate] = []
+        layer_violations: set[tuple[int, str]] = set()
         duplicate_functions: list[tuple[str, int, int, str]] = []
         passthrough_functions: list[tuple[str, int, int, str]] = []
         top_level_statements = len(tree.body)
@@ -477,7 +489,14 @@ class PythonAdapter:
                             ),
                         )
                     )
-                imports.update(_resolve_import_targets(current_module, is_package, node, known_modules))
+                resolved_targets = _resolve_import_targets(current_module, is_package, node, known_modules)
+                current_layer = _path_layer(rel_path)
+                for target_module in resolved_targets:
+                    target_rel_path = known_modules.get(target_module)
+                    target_layer = _path_layer(target_rel_path) if target_rel_path else None
+                    if current_layer and target_rel_path and target_layer and current_layer != target_layer:
+                        layer_violations.add((node.lineno, target_rel_path))
+                imports.update(resolved_targets)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.end_lineno is not None:
                 length = node.end_lineno - node.lineno + 1
                 duplicate_functions.append((node.name, node.lineno, node.end_lineno, _duplicate_function_key(node)))
@@ -572,4 +591,31 @@ class PythonAdapter:
 
         candidates.extend(_build_duplicate_candidates(rel_path, duplicate_functions))
         candidates.extend(_build_remove_abstraction_candidates(rel_path, passthrough_functions))
+        for line_number, target_rel_path in sorted(layer_violations):
+            candidates.append(
+                Candidate(
+                    id=f"py-layer-violation-{rel_path}-{line_number}-{target_rel_path.replace('/', '-')}",
+                    kind="layer_violation_fix",
+                    title=f"Review layer-violating import in {rel_path}",
+                    description=(
+                        f"Import at line {line_number} crosses between `{rel_path}` and `{target_rel_path}`,"
+                        " suggesting a layer boundary violation"
+                    ),
+                    language="python",
+                    scope="architecture",
+                    source=["graph"],
+                    files=[rel_path, target_rel_path],
+                    anchorRegions=[_region(rel_path, line_number, line_number)],
+                    estimatedBenefit=_benefit({"maintainabilityGain": 0.32}),
+                    estimatedRisk=_risk({"semanticRisk": 0.22, "apiRisk": 0.1, "testRisk": 0.18, "conflictRisk": 0.12}),
+                    estimatedDiff=_diff({"filesTouched": 2, "linesAdded": 4, "linesModified": 8}),
+                    confidence=0.69,
+                    applyModeHint="report_only",
+                    requiredChecks=["parse", "lint", "typecheck", "unit_test"],
+                    provenance=Provenance(
+                        detectors=["python-import-layer-violation"],
+                        evidence=[f"line:{line_number}", f"target:{target_rel_path}"],
+                    ),
+                )
+            )
         return candidates, imports

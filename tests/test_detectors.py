@@ -50,6 +50,19 @@ def test_python_adapter_detects_large_module_candidate(tmp_path: Path) -> None:
     assert any(candidate.kind == "split_large_module" and candidate.files == ["large_module.py"] for candidate in candidates)
 
 
+def test_python_adapter_detects_layer_violation_candidate(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (backend / "service.py").write_text("value = 1\n", encoding="utf-8")
+    (frontend / "ui.py").write_text("from backend import service\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "layer_violation_fix" and candidate.files == ["frontend/ui.py", "backend/service.py"] for candidate in candidates)
+
+
 def test_python_adapter_detects_import_cycle_candidate(tmp_path: Path) -> None:
     package = tmp_path / "pkg"
     package.mkdir()
@@ -307,6 +320,29 @@ def test_ts_worker_emits_large_module_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "split_large_module" and candidate["files"] == ["large.ts"] for candidate in payload["candidates"])
+
+def test_ts_worker_emits_layer_violation_candidates(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (backend / "service.ts").write_text("export const service = 1;\n", encoding="utf-8")
+    (frontend / "ui.ts").write_text('import { service } from "../backend/service";\nconsole.log(service);\n', encoding="utf-8")
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "layer_violation_fix" and candidate["files"] == ["frontend/ui.ts", "backend/service.ts"] for candidate in payload["candidates"])
 
 def test_ts_worker_emits_reduce_cycle_candidates(tmp_path: Path) -> None:
     (tmp_path / "a.ts").write_text('import "./b";\nexport const a = 1;\n', encoding="utf-8")

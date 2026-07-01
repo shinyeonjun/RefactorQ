@@ -120,7 +120,7 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
     )
     candidates = [
         _candidate("auto-ok"),
-        _candidate("guarded-ok", apply_mode_hint="guarded"),
+        _candidate("guarded-ok", apply_mode_hint="guarded", files=["src/guarded.py"], symbols=["guarded_symbol"]),
         _candidate("cross-language-low", cross_language=True, impact_level="low", files=["frontend/client.ts"]),
         guarded_cross_language,
         _candidate("cross-language-medium", cross_language=True, impact_level="medium", files=["backend/api.py"]),
@@ -160,6 +160,41 @@ def test_report_mode_preserves_deterministic_ranking_order() -> None:
         "a-first",
         "z-last",
     ]
+
+
+def test_safe_mode_enforces_batch_candidate_budget() -> None:
+    candidates = [_candidate(f"auto-{index}", files=[f"src/{index}.py"]) for index in range(14)]
+
+    result = build_plan(mode="safe", repo=_repo_snapshot(), adapter_names=["python"], candidates=candidates)
+
+    assert len(result.selected_candidates) == 8
+    excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
+    assert excluded["auto-8"] == "safe batch file budget reached"
+
+
+def test_balanced_mode_enforces_guarded_budget_and_overlap_budget() -> None:
+    guarded_candidates = [
+        Candidate.model_validate(
+            {
+                **_candidate(
+                    f"guarded-{index}",
+                    apply_mode_hint="guarded",
+                    files=[f"src/{index}.py"],
+                    symbols=[f"symbol_{index}"],
+                    start_line=1,
+                    end_line=10,
+                ).model_dump(by_alias=True),
+                "kind": "extract_function",
+            }
+        )
+        for index in range(9)
+    ]
+
+    result = build_plan(mode="balanced", repo=_repo_snapshot(), adapter_names=["python"], candidates=guarded_candidates)
+
+    assert len(result.selected_candidates) == 8
+    excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
+    assert excluded["guarded-8"] == "balanced guarded candidate budget reached"
 
 
 def test_report_mode_prefers_higher_cycle_reduction_when_risk_matches() -> None:

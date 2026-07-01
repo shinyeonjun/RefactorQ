@@ -20,6 +20,8 @@ const IGNORED = new Set([
   "coverage",
 ]);
 const SUPPORTED_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
+const CLIENT_LAYER_TOKENS = new Set(["frontend", "client", "web", "ui"]);
+const SERVER_LAYER_TOKENS = new Set(["backend", "server", "api", "controller", "controllers"]);
 
 function createEmptyContextSignals() {
   return {
@@ -96,7 +98,7 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle" | "layer_violation_fix";
 
   title: string;
   description: string;
@@ -591,6 +593,21 @@ function buildRemoveAbstractionCandidates(sourceFile: ts.SourceFile, root: strin
   return candidates;
 }
 
+function pathLayer(relPath: string): "client" | "server" | null {
+  const tokens = new Set(relPath.split("/").map((part) => part.toLowerCase()));
+  for (const token of CLIENT_LAYER_TOKENS) {
+    if (tokens.has(token)) {
+      return "client";
+    }
+  }
+  for (const token of SERVER_LAYER_TOKENS) {
+    if (tokens.has(token)) {
+      return "server";
+    }
+  }
+  return null;
+}
+
 function resolveLocalImport(specifier: string, importer: string, knownFiles: Set<string>): string | null {
   if (!specifier.startsWith(".")) {
     return null;
@@ -663,6 +680,66 @@ function stronglyConnectedComponents(root: string, graph: Map<string, Set<string
     }
   }
   return components;
+}
+
+function buildLayerViolationCandidates(root: string, files: string[], program: ts.Program): CandidatePayload[] {
+  const knownFiles = new Set(files);
+  const candidates: CandidatePayload[] = [];
+
+  for (const fileName of files) {
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile || sourceFile.isDeclarationFile) {
+      continue;
+    }
+    const relPath = relativePosix(root, fileName);
+    const currentLayer = pathLayer(relPath);
+    if (!currentLayer) {
+      continue;
+    }
+    for (const statement of sourceFile.statements) {
+      if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+        continue;
+      }
+      const target = resolveLocalImport(statement.moduleSpecifier.text, fileName, knownFiles);
+      if (!target) {
+        continue;
+      }
+      const targetRelPath = relativePosix(root, target);
+      const targetLayer = pathLayer(targetRelPath);
+      if (!targetLayer || targetLayer === currentLayer) {
+        continue;
+      }
+      const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+      candidates.push({
+        id: `ts-layer-violation-${relPath}-${startLine}-${targetRelPath.replaceAll("/", "-")}`,
+        kind: "layer_violation_fix",
+        title: `Review layer-violating import in ${relPath}`,
+        description: `Import at line ${startLine} crosses between \`${relPath}\` and \`${targetRelPath}\`, suggesting a layer boundary violation`,
+        language: "typescript",
+        scope: "package",
+        source: ["graph"],
+        files: [relPath, targetRelPath],
+        symbols: [],
+        anchorRegions: [{ file: relPath, startLine, endLine: startLine }],
+        estimatedBenefit: { maintainabilityGain: 0.32 },
+        estimatedRisk: { semanticRisk: 0.22, apiRisk: 0.1, testRisk: 0.18, conflictRisk: 0.12 },
+        estimatedDiff: { filesTouched: 2, linesAdded: 4, linesModified: 8 },
+        contextSignals: createEmptyContextSignals(),
+        boundaryImpact: createEmptyBoundaryImpact(),
+        confidence: 0.69,
+        applyModeHint: "report_only",
+        requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+        dependencies: [],
+        conflicts: [],
+        provenance: {
+          detectors: ["ts-worker-layer-violation"],
+          evidence: [`line:${startLine}`, `target:${targetRelPath}`],
+        },
+      });
+    }
+  }
+
+  return candidates;
 }
 
 function buildCycleCandidates(root: string, files: string[], program: ts.Program): CandidatePayload[] {
@@ -844,6 +921,7 @@ function scan(rootArg: string): WorkerScanSuccess {
     candidates.push(...buildDuplicateFunctionCandidates(sourceFile, root));
     candidates.push(...buildRemoveAbstractionCandidates(sourceFile, root));
   }
+  candidates.push(...buildLayerViolationCandidates(root, files, program));
   candidates.push(...buildCycleCandidates(root, files, program));
 
   return {

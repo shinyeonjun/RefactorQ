@@ -10,6 +10,10 @@ from .models import ExcludedCandidate, PlanEdge, PlanMode, PlanResult
 
 _APPLY_MODE_PRIORITY = {"auto": 0, "guarded": 1, "report_only": 2}
 _IMPACT_PRIORITY = {"none": 0, "low": 1, "medium": 2, "high": 3}
+_MODE_BATCH_LIMITS = {
+    "safe": {"max_candidates": 12, "max_files": 8, "max_diff_lines": 180, "max_guarded": 0, "max_high_risk": 0},
+    "balanced": {"max_candidates": 24, "max_files": 16, "max_diff_lines": 420, "max_guarded": 8, "max_high_risk": 2},
+}
 
 
 
@@ -108,22 +112,103 @@ def _report_filter(candidate: Candidate) -> str | None:
     return None
 
 
+def _candidate_diff_lines(candidate: Candidate) -> int:
+    diff = candidate.estimated_diff
+    return diff.lines_modified + diff.lines_added + diff.lines_deleted
+
+
+def _is_high_risk(candidate: Candidate) -> bool:
+    risk = candidate.estimated_risk
+    return (
+        risk.semantic_risk >= 0.4
+        or risk.api_risk >= 0.25
+        or risk.runtime_risk >= 0.3
+        or candidate.boundary_impact.impact_level in {"medium", "high"}
+    )
+
+
+def _batch_selection_reason(
+    candidate: Candidate,
+    *,
+    mode: PlanMode,
+    selected: list[Candidate],
+    selected_ids: set[str],
+    selected_files: set[str],
+    diff_lines_used: int,
+    guarded_count: int,
+    high_risk_count: int,
+) -> str | None:
+    if mode == "report":
+        return None
+    limits = _MODE_BATCH_LIMITS[mode]
+    if len(selected) >= limits["max_candidates"]:
+        return f'{mode} batch candidate budget reached'
+    if candidate.apply_mode_hint == "guarded" and guarded_count >= limits["max_guarded"]:
+        return f'{mode} guarded candidate budget reached'
+    if _is_high_risk(candidate) and high_risk_count >= limits["max_high_risk"]:
+        return f'{mode} high-risk candidate budget reached'
+    if diff_lines_used + _candidate_diff_lines(candidate) > limits["max_diff_lines"]:
+        return f'{mode} batch diff budget reached'
+    if len(selected_files | set(candidate.files)) > limits["max_files"]:
+        return f'{mode} batch file budget reached'
+    if any(dependency_id not in selected_ids for dependency_id in candidate.dependencies):
+        return 'candidate dependencies are not satisfied in the current batch'
+    for current in selected:
+        if _regions_overlap(candidate, current):
+            return f'candidate overlaps already selected batch candidate {current.id}'
+        if current.id in candidate.conflicts or candidate.id in current.conflicts:
+            return f'candidate explicitly conflicts with already selected batch candidate {current.id}'
+    return None
+
+
 def _filter_candidates(candidates: Iterable[Candidate], mode: PlanMode) -> tuple[list[Candidate], list[ExcludedCandidate]]:
     filter_fn = {
         "safe": _safe_filter,
         "balanced": _balanced_filter,
         "report": _report_filter,
     }[mode]
-    selected: list[Candidate] = []
+    eligible: list[Candidate] = []
     excluded: list[ExcludedCandidate] = []
     for candidate in sorted(candidates, key=_ranking_key):
         reason = filter_fn(candidate)
         if reason is None:
-            selected.append(candidate)
+            eligible.append(candidate)
             continue
         if mode == "safe":
             continue
         excluded.append(ExcludedCandidate(candidate=candidate, reason=reason))
+
+    if mode == "report":
+        return eligible, excluded
+
+    selected: list[Candidate] = []
+    selected_ids: set[str] = set()
+    selected_files: set[str] = set()
+    diff_lines_used = 0
+    guarded_count = 0
+    high_risk_count = 0
+    for candidate in eligible:
+        reason = _batch_selection_reason(
+            candidate,
+            mode=mode,
+            selected=selected,
+            selected_ids=selected_ids,
+            selected_files=selected_files,
+            diff_lines_used=diff_lines_used,
+            guarded_count=guarded_count,
+            high_risk_count=high_risk_count,
+        )
+        if reason is not None:
+            excluded.append(ExcludedCandidate(candidate=candidate, reason=reason))
+            continue
+        selected.append(candidate)
+        selected_ids.add(candidate.id)
+        selected_files.update(candidate.files)
+        diff_lines_used += _candidate_diff_lines(candidate)
+        if candidate.apply_mode_hint == "guarded":
+            guarded_count += 1
+        if _is_high_risk(candidate):
+            high_risk_count += 1
     return selected, excluded
 
 
