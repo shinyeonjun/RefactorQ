@@ -3,7 +3,7 @@ import { join, relative, resolve } from "node:path";
 import ts from "typescript";
 
 const PROTOCOL_VERSION = 1;
-const PROTOCOL_CAPABILITIES = ["scan", "deterministic-ordering", "typescript-semantic-candidates"];
+const PROTOCOL_CAPABILITIES = ["scan", "verify", "deterministic-ordering", "typescript-semantic-candidates"];
 const LONG_FUNCTION_THRESHOLD = 40;
 const IGNORED = new Set([
   ".git",
@@ -17,6 +17,7 @@ const IGNORED = new Set([
   "coverage",
 ]);
 const SUPPORTED_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
+
 function createEmptyContextSignals() {
   return {
     coverageRatio: null,
@@ -40,11 +41,12 @@ function createEmptyBoundaryImpact() {
   };
 }
 
+type WorkerCommand = "scan" | "verify";
 
 type WorkerRequest = {
   protocolVersion: number;
   capabilities?: string[];
-  command: "scan";
+  command: WorkerCommand;
   root: string;
 };
 
@@ -58,17 +60,36 @@ type WorkerFailure = {
   protocolVersion: number;
   capabilities: string[];
   ok: false;
+  command: WorkerCommand;
   error: WorkerError;
+};
+
+type VerificationCheckPayload = {
+  name: string;
+  kind: "parse" | "typecheck" | "lint" | "build" | "unit_test";
+  status: "passed" | "failed" | "skipped";
+  evidence: string[];
+  details: Record<string, unknown>;
 };
 
 type WorkerSuccess = {
   protocolVersion: number;
   capabilities: string[];
   ok: true;
+  command: WorkerCommand;
+};
+
+type WorkerScanSuccess = WorkerSuccess & {
+  command: "scan";
   candidates: CandidatePayload[];
 };
 
-type WorkerResponse = WorkerFailure | WorkerSuccess;
+type WorkerVerifySuccess = WorkerSuccess & {
+  command: "verify";
+  checks: VerificationCheckPayload[];
+};
+
+type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
@@ -155,6 +176,20 @@ function collectSourceFiles(rootArg: string): string[] {
   const files: string[] = [];
   walk(root, root, files);
   return files.sort((left, right) => relativePosix(root, left).localeCompare(relativePosix(root, right)));
+}
+
+function createProgram(rootArg: string): { root: string; files: string[]; program: ts.Program } {
+  const root = resolve(rootArg);
+  const files = collectSourceFiles(root);
+  const program = ts.createProgram(files, {
+    allowJs: true,
+    checkJs: false,
+    noEmit: true,
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    jsx: ts.JsxEmit.Preserve,
+  });
+  return { root, files, program };
 }
 
 function sortCandidates(candidates: CandidatePayload[]): CandidatePayload[] {
@@ -318,17 +353,54 @@ function buildLongFunctionCandidates(sourceFile: ts.SourceFile, root: string): C
   return candidates;
 }
 
-function scan(rootArg: string): WorkerSuccess {
-  const root = resolve(rootArg);
-  const files = collectSourceFiles(root);
-  const program = ts.createProgram(files, {
-    allowJs: true,
-    checkJs: false,
-    noEmit: true,
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-    jsx: ts.JsxEmit.Preserve,
+function formatDiagnostic(root: string, diagnostic: ts.Diagnostic): string {
+  const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
+  if (!diagnostic.file || diagnostic.start === undefined) {
+    return message;
+  }
+  const { line, character } = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
+  return `${relativePosix(root, diagnostic.file.fileName)}:${line + 1}:${character + 1} ${message}`;
+}
+
+function buildVerificationChecks(root: string, files: string[], program: ts.Program): VerificationCheckPayload[] {
+  const syntacticDiagnostics = [
+    ...program.getOptionsDiagnostics(),
+    ...files.flatMap((fileName) => {
+      const sourceFile = program.getSourceFile(fileName);
+      return sourceFile ? program.getSyntacticDiagnostics(sourceFile) : [];
+    }),
+  ];
+  const semanticDiagnostics = files.flatMap((fileName) => {
+    const sourceFile = program.getSourceFile(fileName);
+    return sourceFile ? program.getSemanticDiagnostics(sourceFile) : [];
   });
+
+  return [
+    {
+      name: "typescript_parse",
+      kind: "parse",
+      status: syntacticDiagnostics.length === 0 ? "passed" : "failed",
+      evidence:
+        syntacticDiagnostics.length === 0
+          ? [`parsed ${files.length} TypeScript/JavaScript files`]
+          : syntacticDiagnostics.slice(0, 20).map((diagnostic) => formatDiagnostic(root, diagnostic)),
+      details: { fileCount: files.length, diagnosticCount: syntacticDiagnostics.length },
+    },
+    {
+      name: "typescript_typecheck",
+      kind: "typecheck",
+      status: semanticDiagnostics.length === 0 ? "passed" : "failed",
+      evidence:
+        semanticDiagnostics.length === 0
+          ? [`typechecked ${files.length} TypeScript/JavaScript files`]
+          : semanticDiagnostics.slice(0, 20).map((diagnostic) => formatDiagnostic(root, diagnostic)),
+      details: { fileCount: files.length, diagnosticCount: semanticDiagnostics.length },
+    },
+  ];
+}
+
+function scan(rootArg: string): WorkerScanSuccess {
+  const { root, files, program } = createProgram(rootArg);
   const checker = program.getTypeChecker();
   const candidates: CandidatePayload[] = [];
 
@@ -345,7 +417,19 @@ function scan(rootArg: string): WorkerSuccess {
     protocolVersion: PROTOCOL_VERSION,
     capabilities: [...PROTOCOL_CAPABILITIES],
     ok: true,
+    command: "scan",
     candidates: sortCandidates(candidates),
+  };
+}
+
+function verify(rootArg: string): WorkerVerifySuccess {
+  const { root, files, program } = createProgram(rootArg);
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    capabilities: [...PROTOCOL_CAPABILITIES],
+    ok: true,
+    command: "verify",
+    checks: buildVerificationChecks(root, files, program),
   };
 }
 
@@ -357,11 +441,12 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-function failure(code: string, message: string, details?: Record<string, unknown>): WorkerFailure {
+function failure(command: WorkerCommand, code: string, message: string, details?: Record<string, unknown>): WorkerFailure {
   return {
     protocolVersion: PROTOCOL_VERSION,
     capabilities: [...PROTOCOL_CAPABILITIES],
     ok: false,
+    command,
     error: { code, message, details },
   };
 }
@@ -371,29 +456,30 @@ function parseRequest(payload: string): WorkerRequest {
   try {
     parsed = JSON.parse(payload);
   } catch (error) {
-    throw failure("malformed_json", "Worker request was not valid JSON", {
+    throw failure("scan", "malformed_json", "Worker request was not valid JSON", {
       error: error instanceof Error ? error.message : String(error),
     });
   }
 
   if (!parsed || typeof parsed !== "object") {
-    throw failure("invalid_request", "Worker request must be an object");
+    throw failure("scan", "invalid_request", "Worker request must be an object");
   }
 
   const request = parsed as Partial<WorkerRequest>;
+  const command = request.command ?? "scan";
   if (request.protocolVersion !== PROTOCOL_VERSION) {
-    throw failure("version_mismatch", "Worker protocol version mismatch", {
+    throw failure(command, "version_mismatch", "Worker protocol version mismatch", {
       expected: PROTOCOL_VERSION,
       actual: request.protocolVersion,
     });
   }
-  if (request.command !== "scan") {
-    throw failure("unsupported_command", "Worker command is not supported", {
+  if (request.command !== "scan" && request.command !== "verify") {
+    throw failure(command, "unsupported_command", "Worker command is not supported", {
       command: request.command,
     });
   }
   if (typeof request.root !== "string" || request.root.length === 0) {
-    throw failure("invalid_request", "Worker request must include a root path");
+    throw failure(command, "invalid_request", "Worker request must include a root path");
   }
   return request as WorkerRequest;
 }
@@ -404,12 +490,12 @@ async function main(): Promise<void> {
 
   try {
     const request = parseRequest(await readStdin());
-    response = scan(request.root);
+    response = request.command === "scan" ? scan(request.root) : verify(request.root);
   } catch (error) {
     shouldFail = true;
     response = typeof error === "object" && error !== null && "ok" in error
       ? (error as WorkerFailure)
-      : failure("scan_failed", error instanceof Error ? error.message : String(error));
+      : failure("scan", "execution_failed", error instanceof Error ? error.message : String(error));
   }
 
   process.stdout.write(`${JSON.stringify(response)}\n`);

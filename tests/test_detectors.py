@@ -27,6 +27,7 @@ def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, mon
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": PROTOCOL_CAPABILITIES,
         "ok": True,
+        "command": "scan",
         "candidates": [
             {
                 "id": "ts-unused-import-zeta-1-zeta",
@@ -42,9 +43,13 @@ def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, mon
                 "estimatedBenefit": {"maintainabilityGain": 0.08},
                 "estimatedRisk": {"semanticRisk": 0.02, "conflictRisk": 0.03},
                 "estimatedDiff": {"filesTouched": 1, "linesDeleted": 1, "linesModified": 1},
+                "contextSignals": {},
+                "boundaryImpact": {},
                 "confidence": 0.9,
                 "applyModeHint": "auto",
                 "requiredChecks": ["parse", "lint", "typecheck"],
+                "dependencies": [],
+                "conflicts": [],
                 "provenance": {"detectors": ["ts-worker-unused-import"], "evidence": ["line:1"]},
             },
             {
@@ -61,14 +66,18 @@ def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, mon
                 "estimatedBenefit": {"maintainabilityGain": 0.08},
                 "estimatedRisk": {"semanticRisk": 0.02, "conflictRisk": 0.03},
                 "estimatedDiff": {"filesTouched": 1, "linesDeleted": 1, "linesModified": 1},
+                "contextSignals": {},
+                "boundaryImpact": {},
                 "confidence": 0.9,
                 "applyModeHint": "auto",
                 "requiredChecks": ["parse", "lint", "typecheck"],
+                "dependencies": [],
+                "conflicts": [],
                 "provenance": {"detectors": ["ts-worker-unused-import"], "evidence": ["line:1"]},
             },
         ],
     }
-    monkeypatch.setattr(TypeScriptAdapter, "_invoke_worker", lambda self, root: unsorted_payload)
+    monkeypatch.setattr(TypeScriptAdapter, "_invoke_scan", lambda self, root: unsorted_payload)
 
     candidates = TypeScriptAdapter().scan(tmp_path)
 
@@ -79,7 +88,11 @@ def test_typescript_adapter_reports_worker_contract_failures(tmp_path: Path, mon
     sample = tmp_path / "sample.ts"
     sample.write_text('import { readFile } from "node:fs";\n\nconsole.log("hi");\n', encoding="utf-8")
 
-    monkeypatch.setattr(TypeScriptAdapter, "_invoke_worker", lambda self, root: {"protocolVersion": PROTOCOL_VERSION + 1, "capabilities": PROTOCOL_CAPABILITIES, "ok": True, "candidates": []})
+    monkeypatch.setattr(
+        TypeScriptAdapter,
+        "_invoke_scan",
+        lambda self, root: {"protocolVersion": PROTOCOL_VERSION + 1, "capabilities": PROTOCOL_CAPABILITIES, "ok": True, "command": "scan", "candidates": []},
+    )
 
     candidates = TypeScriptAdapter().scan(tmp_path)
 
@@ -99,7 +112,7 @@ def test_typescript_adapter_reports_worker_process_failures(tmp_path: Path, monk
     def raise_non_zero(self: TypeScriptAdapter, root: Path) -> object:
         raise subprocess.CalledProcessError(1, ["node", "worker"], output="not-json", stderr="boom")
 
-    monkeypatch.setattr(TypeScriptAdapter, "_invoke_worker", raise_non_zero)
+    monkeypatch.setattr(TypeScriptAdapter, "_invoke_scan", raise_non_zero)
 
     candidates = TypeScriptAdapter().scan(tmp_path)
 
@@ -108,6 +121,37 @@ def test_typescript_adapter_reports_worker_process_failures(tmp_path: Path, monk
     assert failure.kind == "custom"
     assert any(evidence.startswith("code:non_zero_exit") for evidence in failure.provenance.evidence)
     assert not any(candidate.kind == "unused_import" for candidate in candidates)
+
+
+def test_typescript_adapter_verify_surfaces_failed_checks(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.ts"
+    sample.write_text("const broken: string = 123;\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        TypeScriptAdapter,
+        "_invoke_verify",
+        lambda self, root: {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": PROTOCOL_CAPABILITIES,
+            "ok": True,
+            "command": "verify",
+            "checks": [
+                {
+                    "name": "typescript_typecheck",
+                    "kind": "typecheck",
+                    "status": "failed",
+                    "evidence": ["sample.ts:1:1 mock failure"],
+                    "details": {"diagnosticCount": 1},
+                }
+            ],
+        },
+    )
+
+    checks = TypeScriptAdapter().verify(tmp_path)
+
+    assert len(checks) == 1
+    assert checks[0].status == "failed"
+    assert checks[0].name == "typescript_typecheck"
 
 
 def test_ts_worker_emits_protocol_version_and_sorted_candidates(tmp_path: Path) -> None:
@@ -129,8 +173,33 @@ def test_ts_worker_emits_protocol_version_and_sorted_candidates(tmp_path: Path) 
 
     assert payload["protocolVersion"] == PROTOCOL_VERSION
     assert payload["ok"] is True
+    assert payload["command"] == "scan"
     assert payload["capabilities"] == PROTOCOL_CAPABILITIES
     assert [candidate["files"][0] for candidate in payload["candidates"]] == ["alpha.ts", "zeta.ts"]
     first_candidate = payload["candidates"][0]
     for key in ["contextSignals", "boundaryImpact", "dependencies", "conflicts"]:
         assert key in first_candidate
+
+
+def test_ts_worker_verify_reports_semantic_failures(tmp_path: Path) -> None:
+    (tmp_path / "broken.ts").write_text("const broken: string = 123;\n", encoding="utf-8")
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["verify"], "command": "verify", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert payload["protocolVersion"] == PROTOCOL_VERSION
+    assert payload["ok"] is True
+    assert payload["command"] == "verify"
+    statuses = {check["name"]: check["status"] for check in payload["checks"]}
+    assert statuses["typescript_parse"] == "passed"
+    assert statuses["typescript_typecheck"] == "failed"

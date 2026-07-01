@@ -38,68 +38,40 @@ def plan(
 @app.command()
 def apply(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
-    mode: str = typer.Option("safe", "--mode"),
+    mode: PlanMode = typer.Option("safe", "--mode"),
 ) -> None:
-    """Emit the current apply scaffold status for a repository."""
-    result = service.scan(repo)
-    _emit_json(
-        {
-            "mode": mode,
-            "repo": result.repo.model_dump(by_alias=True),
-            "status": "apply pipeline scaffolded",
-            "candidateCount": len(result.candidates),
-        }
-    )
+    """Apply deterministic low-risk refactors for the selected plan."""
+    result = service.apply(repo, mode)
+    _emit_json(result.model_dump(by_alias=True))
 
 
 @app.command()
 def verify(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
 ) -> None:
-    """Emit the current verification scaffold status for a repository."""
-    result = service.scan(repo)
-    _emit_json(
-        {
-            "repo": result.repo.model_dump(by_alias=True),
-            "status": "verification scaffolded",
-            "checks": ["parse", "lint", "typecheck", "build", "unit_test"],
-        }
-    )
+    """Run structural verification for supported repository languages."""
+    result = service.verify(repo)
+    _emit_json(result.model_dump(by_alias=True))
 
 
 @app.command()
 def report(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
-    mode: str = typer.Option("report", "--mode"),
+    mode: PlanMode = typer.Option("report", "--mode"),
 ) -> None:
-    """Emit the current report scaffold status for a repository."""
-    result = service.scan(repo)
-    _emit_json(
-        {
-            "mode": mode,
-            "repo": result.repo.model_dump(by_alias=True),
-            "status": "report scaffold ready",
-            "candidateCount": len(result.candidates),
-        }
-    )
+    """Summarize plan output and current deterministic execution support."""
+    result = service.report(repo, mode)
+    _emit_json(result.model_dump(by_alias=True))
 
 
 @app.command(name="run")
 def run_pipeline(
     repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
-    mode: str = typer.Option("safe", "--mode"),
+    mode: PlanMode = typer.Option("safe", "--mode"),
 ) -> None:
-    """Run the current scan-first pipeline scaffold."""
-    result = service.scan(repo)
-    _emit_json(
-        {
-            "mode": mode,
-            "repo": result.repo.model_dump(by_alias=True),
-            "adapters": result.adapter_names,
-            "candidateCount": len(result.candidates),
-            "status": "run scaffold ready",
-        }
-    )
+    """Plan, apply deterministic refactors, verify, and roll back on failure."""
+    result = service.run(repo, mode)
+    _emit_json(result.model_dump(by_alias=True))
 
 
 def main() -> None:

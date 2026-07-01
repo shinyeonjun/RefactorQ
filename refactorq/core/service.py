@@ -6,9 +6,12 @@ from pydantic import BaseModel, Field
 
 from refactorq.adapters.registry import detect_adapters
 from refactorq.core.candidate import Candidate
+from refactorq.core.execution import ApplyResult, ReportResult, RunResult, apply_plan, report_plan, run_plan
 from refactorq.core.planning import PlanMode, PlanResult, build_plan
 from refactorq.core.repo import RepoSnapshot, detect_repo
 from refactorq.core.repo_source import normalize_repo_source
+from refactorq.core.verification import VerificationResult
+from refactorq.core.verification.service import verify_repo
 
 
 class ScanResult(BaseModel):
@@ -46,3 +49,15 @@ class RefactorQService:
             adapter_names=scan_result.adapter_names,
             candidates=scan_result.candidates,
         )
+
+    def apply(self, root: Path, mode: PlanMode) -> ApplyResult:
+        return apply_plan(root, self.plan(root, mode))
+
+    def verify(self, root: Path) -> VerificationResult:
+        return verify_repo(root)
+
+    def report(self, root: Path, mode: PlanMode) -> ReportResult:
+        return report_plan(root, self.plan(root, mode))
+
+    def run(self, root: Path, mode: PlanMode) -> RunResult:
+        return run_plan(root, self.plan(root, mode))
