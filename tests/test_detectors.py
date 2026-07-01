@@ -19,6 +19,16 @@ def test_python_adapter_detects_unused_import(tmp_path: Path) -> None:
     assert any(candidate.kind == "unused_import" for candidate in candidates)
 
 
+def test_python_adapter_detects_private_dead_code(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("def _helper():\n    return 1\n\nprint('hi')\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "dead_code" and candidate.symbols == ["_helper"] for candidate in candidates)
+
+
+
 def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "sample.ts"
     sample.write_text('import { readFile } from "node:fs";\n\nconsole.log("hi");\n', encoding="utf-8")
@@ -203,3 +213,22 @@ def test_ts_worker_verify_reports_semantic_failures(tmp_path: Path) -> None:
     statuses = {check["name"]: check["status"] for check in payload["checks"]}
     assert statuses["typescript_parse"] == "passed"
     assert statuses["typescript_typecheck"] == "failed"
+
+
+def test_ts_worker_emits_unused_symbol_candidates(tmp_path: Path) -> None:
+    (tmp_path / "unused.ts").write_text("function helper() {\n  return 1;\n}\n\nconsole.log('ok');\n", encoding="utf-8")
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "unused_symbol" and candidate["symbols"] == ["helper"] for candidate in payload["candidates"])

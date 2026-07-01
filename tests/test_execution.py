@@ -49,6 +49,30 @@ def test_apply_removes_python_unused_import(tmp_path: Path) -> None:
     assert sample.read_text(encoding="utf-8") == "\nprint('hi')\n"
 
 
+def test_apply_removes_python_private_dead_code(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("def _helper():\n    return 1\n\nprint('hi')\n", encoding="utf-8")
+
+    result = RefactorQService().apply(tmp_path, "safe")
+
+    assert result.status == "applied"
+    assert result.changed_files == ["sample.py"]
+    assert [candidate.kind for candidate in result.applied_candidates] == ["dead_code"]
+    assert sample.read_text(encoding="utf-8") == "\nprint('hi')\n"
+
+
+def test_apply_removes_typescript_unused_symbol(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.ts"
+    sample.write_text("function helper() {\n  return 1;\n}\n\nconsole.log('ok');\n", encoding="utf-8")
+
+    result = RefactorQService().apply(tmp_path, "safe")
+
+    assert result.status == "applied"
+    assert result.changed_files == ["sample.ts"]
+    assert [candidate.kind for candidate in result.applied_candidates] == ["unused_symbol"]
+    assert sample.read_text(encoding="utf-8") == "\nconsole.log('ok');\n"
+
+
 
 def test_apply_rewrites_named_typescript_unused_imports(tmp_path: Path) -> None:
     sample = tmp_path / "sample.ts"

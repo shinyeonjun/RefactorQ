@@ -169,25 +169,37 @@ def _rewrite_unused_import_line(candidate: Candidate, line: str) -> str | None:
 def _auto_support_reason(root: Path, candidate: Candidate) -> str | None:
     if candidate.apply_mode_hint != "auto":
         return "candidate requires guarded handling"
-    if candidate.kind != "unused_import":
-        return "deterministic patcher currently supports unused_import only"
+    if candidate.kind not in {"unused_import", "dead_code", "unused_symbol"}:
+        return "deterministic patcher currently supports unused_import, dead_code, and unused_symbol only"
     if len(candidate.files) != 1 or len(candidate.anchor_regions) != 1 or len(candidate.symbols) != 1:
         return "candidate does not target a single file, region, and symbol"
     region = candidate.anchor_regions[0]
-    if region.start_line != region.end_line:
-        return "candidate spans multiple lines"
     target = root / candidate.files[0]
     if not target.exists():
         return "candidate target file is missing"
     lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
-    if region.start_line < 1 or region.start_line > len(lines):
+    if region.start_line < 1 or region.end_line > len(lines):
         return "candidate line falls outside the current file"
-    line = lines[region.start_line - 1]
-    if not _looks_like_single_line_import(line):
-        return "candidate import statement is not a supported single-line import"
-    if _rewrite_unused_import_line(candidate, line) is None:
-        return "candidate import statement cannot be rewritten deterministically"
-    return None
+    if candidate.kind == "unused_import":
+        if region.start_line != region.end_line:
+            return "candidate spans multiple lines"
+        line = lines[region.start_line - 1]
+        if not _looks_like_single_line_import(line):
+            return "candidate import statement is not a supported single-line import"
+        if _rewrite_unused_import_line(candidate, line) is None:
+            return "candidate import statement cannot be rewritten deterministically"
+        return None
+    if candidate.language == "python" and candidate.kind == "dead_code":
+        return None
+    if candidate.language in {"typescript", "javascript"} and candidate.kind == "unused_symbol":
+        return None
+    return "candidate kind is not supported for this language"
+
+
+def _delete_region(lines: list[str], start_line: int, end_line: int) -> list[str]:
+    updated = list(lines)
+    del updated[start_line - 1 : end_line]
+    return updated
 
 
 def _apply_auto_candidate(lines: list[str], candidate: Candidate) -> tuple[list[str], bool]:
@@ -195,15 +207,20 @@ def _apply_auto_candidate(lines: list[str], candidate: Candidate) -> tuple[list[
     index = region.start_line - 1
     if index < 0 or index >= len(lines):
         return lines, False
-    rewritten = _rewrite_unused_import_line(candidate, lines[index])
-    if rewritten is None:
-        return lines, False
-    updated = list(lines)
-    if rewritten == "":
-        del updated[index]
-    else:
-        updated[index] = rewritten
-    return updated, updated != lines
+    if candidate.kind == "unused_import":
+        rewritten = _rewrite_unused_import_line(candidate, lines[index])
+        if rewritten is None:
+            return lines, False
+        updated = list(lines)
+        if rewritten == "":
+            del updated[index]
+        else:
+            updated[index] = rewritten
+        return updated, updated != lines
+    if candidate.kind in {"dead_code", "unused_symbol"}:
+        updated = _delete_region(lines, region.start_line, region.end_line)
+        return updated, updated != lines
+    return lines, False
 
 
 def _snapshot_repo(root: Path) -> dict[str, bytes]:

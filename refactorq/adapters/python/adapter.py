@@ -48,6 +48,13 @@ def _exported_names(tree: ast.AST) -> set[str]:
 
 
 
+def _referenced_names(tree: ast.AST) -> set[str]:
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
 class PythonAdapter:
     name: str = "python"
     extensions: tuple[str, ...] = (".py",)
@@ -70,9 +77,10 @@ class PythonAdapter:
 
         rel_path = path.relative_to(root).as_posix()
         lines = source.splitlines()
-        used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-        used_names.update(_exported_names(tree))
+        referenced_names = _referenced_names(tree)
+        exported_names = _exported_names(tree)
         candidates: list[Candidate] = []
+
 
 
         for node in ast.walk(tree):
@@ -81,7 +89,7 @@ class PythonAdapter:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for alias in node.names:
                     bound_name = alias.asname or alias.name.split(".")[0]
-                    if bound_name in used_names:
+                    if bound_name in referenced_names:
                         continue
                     candidates.append(
                         Candidate(
@@ -157,4 +165,43 @@ class PythonAdapter:
                         ),
                     )
                 )
+
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.end_lineno is None:
+                continue
+            if not node.name.startswith("_") or node.name.startswith("__"):
+                continue
+            if node.name in referenced_names or node.name in exported_names:
+                continue
+            length = node.end_lineno - node.lineno + 1
+            candidates.append(
+                Candidate(
+                    id=f"py-dead-code-{rel_path}-{node.lineno}-{node.name}",
+                    kind="dead_code",
+                    title=f"Remove unused private function {node.name}",
+                    description=f"Top-level private function `{node.name}` in {rel_path} is not referenced",
+                    language="python",
+                    scope="module",
+                    source=["static"],
+                    files=[rel_path],
+                    symbols=[node.name],
+                    anchorRegions=[_region(rel_path, node.lineno, node.end_lineno)],
+                    estimatedBenefit=_benefit({"maintainabilityGain": 0.18}),
+                    estimatedRisk=_risk({"semanticRisk": 0.08, "conflictRisk": 0.04}),
+                    estimatedDiff=_diff(
+                        {
+                            "filesTouched": 1,
+                            "linesDeleted": length,
+                            "linesModified": length,
+                        }
+                    ),
+                    confidence=0.86,
+                    applyModeHint="auto",
+                    requiredChecks=["parse", "lint", "typecheck"],
+                    provenance=Provenance(
+                        detectors=["python-ast-dead-code"],
+                        evidence=[f"line_span:{length}", f"symbol:{node.name}"],
+                    ),
+                )
+            )
         return candidates

@@ -93,11 +93,12 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "extract_function";
+  kind: "unused_import" | "unused_symbol" | "extract_function";
+
   title: string;
   description: string;
   language: "typescript";
-  scope: "local";
+  scope: "local" | "module";
   source: Array<"static" | "metric">;
   files: string[];
   symbols: string[];
@@ -213,6 +214,38 @@ function isImportedIdentifier(node: ts.Identifier): boolean {
   return ts.isImportClause(parent) || ts.isImportSpecifier(parent) || ts.isNamespaceImport(parent) || ts.isImportEqualsDeclaration(parent);
 }
 
+function isDeclarationIdentifier(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  return (
+    isImportedIdentifier(node)
+    || (ts.isFunctionDeclaration(parent) && parent.name === node)
+    || (ts.isVariableDeclaration(parent) && parent.name === node)
+    || (ts.isClassDeclaration(parent) && parent.name === node)
+  );
+}
+
+function isExportedNode(node: ts.Node): boolean {
+  return ts.getCombinedModifierFlags(node as ts.Declaration) & ts.ModifierFlags.Export ? true : false;
+}
+
+function countSymbolReferences(checker: ts.TypeChecker, sourceFile: ts.SourceFile): Map<ts.Symbol, number> {
+  const usageCounts = new Map<ts.Symbol, number>();
+
+  function visit(node: ts.Node): void {
+    if (ts.isIdentifier(node) && !isDeclarationIdentifier(node)) {
+      const symbol = checker.getSymbolAtLocation(node);
+      if (symbol) {
+        usageCounts.set(symbol, (usageCounts.get(symbol) ?? 0) + 1);
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return usageCounts;
+}
+
+
 function buildUnusedImportCandidates(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
@@ -256,19 +289,9 @@ function buildUnusedImportCandidates(
     ts.forEachChild(node, collectImports);
   }
 
-  const usageCounts = new Map<ts.Symbol, number>();
-  function collectUsages(node: ts.Node): void {
-    if (ts.isIdentifier(node) && !isImportedIdentifier(node)) {
-      const symbol = checker.getSymbolAtLocation(node);
-      if (symbol) {
-        usageCounts.set(symbol, (usageCounts.get(symbol) ?? 0) + 1);
-      }
-    }
-    ts.forEachChild(node, collectUsages);
-  }
-
+  const usageCounts = countSymbolReferences(checker, sourceFile);
   collectImports(sourceFile);
-  collectUsages(sourceFile);
+
 
   return imports
     .filter((binding) => (usageCounts.get(binding.symbol) ?? 0) === 0)
@@ -353,6 +376,61 @@ function buildLongFunctionCandidates(sourceFile: ts.SourceFile, root: string): C
   return candidates;
 }
 
+function buildUnusedSymbolCandidates(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  root: string,
+): CandidatePayload[] {
+  const relPath = relativePosix(root, sourceFile.fileName);
+  const usageCounts = countSymbolReferences(checker, sourceFile);
+  const candidates: CandidatePayload[] = [];
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isFunctionDeclaration(statement) || !statement.name || statement.end === undefined) {
+      continue;
+    }
+    if (isExportedNode(statement)) {
+      continue;
+    }
+    const symbol = checker.getSymbolAtLocation(statement.name);
+    if (!symbol || (usageCounts.get(symbol) ?? 0) > 0) {
+      continue;
+    }
+    const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+    const endLine = sourceFile.getLineAndCharacterOfPosition(statement.end).line + 1;
+    const length = endLine - startLine + 1;
+    candidates.push({
+      id: `ts-unused-symbol-${relPath}-${startLine}-${statement.name.text}`,
+      kind: "unused_symbol",
+      title: `Remove unused symbol ${statement.name.text}`,
+      description: `Top-level TypeScript function \`${statement.name.text}\` in ${relPath} is not referenced`,
+      language: "typescript",
+      scope: "module",
+      source: ["static"],
+      files: [relPath],
+      symbols: [statement.name.text],
+      anchorRegions: [{ file: relPath, startLine, endLine }],
+      estimatedBenefit: { maintainabilityGain: 0.18 },
+      estimatedRisk: { semanticRisk: 0.08, conflictRisk: 0.04 },
+      estimatedDiff: { filesTouched: 1, linesDeleted: length, linesModified: length },
+      contextSignals: createEmptyContextSignals(),
+      boundaryImpact: createEmptyBoundaryImpact(),
+      confidence: 0.86,
+      applyModeHint: "auto",
+      requiredChecks: ["parse", "lint", "typecheck"],
+      dependencies: [],
+      conflicts: [],
+      provenance: {
+        detectors: ["ts-worker-unused-symbol"],
+        evidence: [`line_span:${length}`, `symbol:${statement.name.text}`],
+      },
+    });
+  }
+
+  return candidates;
+}
+
+
 function formatDiagnostic(root: string, diagnostic: ts.Diagnostic): string {
   const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
   if (!diagnostic.file || diagnostic.start === undefined) {
@@ -410,6 +488,7 @@ function scan(rootArg: string): WorkerScanSuccess {
       continue;
     }
     candidates.push(...buildUnusedImportCandidates(checker, sourceFile, root));
+    candidates.push(...buildUnusedSymbolCandidates(checker, sourceFile, root));
     candidates.push(...buildLongFunctionCandidates(sourceFile, root));
   }
 
