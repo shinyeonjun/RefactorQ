@@ -96,7 +96,7 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "split_large_module" | "reduce_cycle";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle";
 
   title: string;
   description: string;
@@ -230,6 +230,34 @@ function duplicateFunctionKey(sourceFile: ts.SourceFile, node: ts.FunctionDeclar
     return null;
   }
   return `${parameters}|${body}`;
+}
+
+function passthroughTarget(node: ts.FunctionDeclaration): string | null {
+  if (!node.name || !node.body || node.body.statements.length !== 1 || isExportedNode(node)) {
+    return null;
+  }
+  const [statement] = node.body.statements;
+  if (!statement || !ts.isReturnStatement(statement) || !statement.expression || !ts.isCallExpression(statement.expression)) {
+    return null;
+  }
+  if (!ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text === node.name.text) {
+    return null;
+  }
+  if (statement.expression.arguments.length !== node.parameters.length) {
+    return null;
+  }
+  const parameterNames = node.parameters.map((parameter) => ts.isIdentifier(parameter.name) ? parameter.name.text : null);
+  if (parameterNames.some((name) => name === null)) {
+    return null;
+  }
+  const forwardedNames = statement.expression.arguments.map((argument) => ts.isIdentifier(argument) ? argument.text : null);
+  if (forwardedNames.some((name) => name === null)) {
+    return null;
+  }
+  if (parameterNames.join(",") !== forwardedNames.join(",")) {
+    return null;
+  }
+  return statement.expression.expression.text;
 }
 
 function isImportedIdentifier(node: ts.Identifier): boolean {
@@ -509,6 +537,60 @@ function buildDuplicateFunctionCandidates(sourceFile: ts.SourceFile, root: strin
   return candidates;
 }
 
+function buildRemoveAbstractionCandidates(sourceFile: ts.SourceFile, root: string): CandidatePayload[] {
+  const relPath = relativePosix(root, sourceFile.fileName);
+  const candidates: CandidatePayload[] = [];
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isFunctionDeclaration(statement) || !statement.name || statement.end === undefined) {
+      continue;
+    }
+    if (!statement.name.text.startsWith("_")) {
+      continue;
+    }
+    const target = passthroughTarget(statement);
+    if (!target) {
+      continue;
+    }
+    const span = lineSpan(sourceFile, statement);
+    candidates.push({
+      id: `ts-remove-abstraction-${relPath}-${span.startLine}-${statement.name.text}`,
+      kind: "remove_abstraction",
+      title: `Inline thin wrapper ${statement.name.text}`,
+      description: `Private TypeScript wrapper \`${statement.name.text}\` in ${relPath} only forwards to \`${target}\` and can likely be removed`,
+      language: "typescript",
+      scope: "module",
+      source: ["static", "metric"],
+      files: [relPath],
+      symbols: [statement.name.text],
+      anchorRegions: [{ file: relPath, startLine: span.startLine, endLine: span.endLine }],
+      estimatedBenefit: {
+        complexityReduction: Math.min(1, span.length / Math.max(LONG_FUNCTION_THRESHOLD, 1)),
+        maintainabilityGain: 0.26,
+      },
+      estimatedRisk: { semanticRisk: 0.2, apiRisk: 0.08, testRisk: 0.18, conflictRisk: 0.12 },
+      estimatedDiff: {
+        filesTouched: 1,
+        linesAdded: Math.max(1, Math.floor(span.length / 3)),
+        linesModified: span.length,
+      },
+      contextSignals: createEmptyContextSignals(),
+      boundaryImpact: createEmptyBoundaryImpact(),
+      confidence: 0.74,
+      applyModeHint: "guarded",
+      requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+      dependencies: [],
+      conflicts: [],
+      provenance: {
+        detectors: ["ts-worker-passthrough-wrapper"],
+        evidence: [`symbol:${statement.name.text}`, `target:${target}`, `line_span:${span.length}`],
+      },
+    });
+  }
+
+  return candidates;
+}
+
 function resolveLocalImport(specifier: string, importer: string, knownFiles: Set<string>): string | null {
   if (!specifier.startsWith(".")) {
     return null;
@@ -760,6 +842,7 @@ function scan(rootArg: string): WorkerScanSuccess {
     candidates.push(...buildLongFunctionCandidates(sourceFile, root));
     candidates.push(...buildLargeModuleCandidates(sourceFile, root));
     candidates.push(...buildDuplicateFunctionCandidates(sourceFile, root));
+    candidates.push(...buildRemoveAbstractionCandidates(sourceFile, root));
   }
   candidates.push(...buildCycleCandidates(root, files, program));
 

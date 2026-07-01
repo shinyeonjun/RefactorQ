@@ -104,10 +104,25 @@ def test_safe_mode_filters_to_low_risk_auto_candidates() -> None:
 
 
 def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
+    guarded_cross_language = Candidate.model_validate(
+        {
+            **_candidate(
+                "guarded-cross-language-low",
+                apply_mode_hint="guarded",
+                cross_language=True,
+                impact_level="low",
+                files=["backend/api.py"],
+                symbols=["very_long_function"],
+            ).model_dump(by_alias=True),
+            "kind": "extract_function",
+            "scope": "module",
+        }
+    )
     candidates = [
         _candidate("auto-ok"),
         _candidate("guarded-ok", apply_mode_hint="guarded"),
         _candidate("cross-language-low", cross_language=True, impact_level="low", files=["frontend/client.ts"]),
+        guarded_cross_language,
         _candidate("cross-language-medium", cross_language=True, impact_level="medium", files=["backend/api.py"]),
         _candidate("report-only", apply_mode_hint="report_only"),
         _candidate(
@@ -119,7 +134,7 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
 
     result = build_plan(mode="balanced", repo=_repo_snapshot(), adapter_names=["python"], candidates=candidates)
 
-    assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "cross-language-low", "guarded-ok"]
+    assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "cross-language-low", "guarded-ok", "guarded-cross-language-low"]
     excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
     assert (
         excluded["cross-language-medium"]
@@ -313,6 +328,102 @@ def test_plan_adds_duplicate_extract_and_cycle_split_dependencies() -> None:
         "reduce-cycle",
         "reduce cycle before splitting the related module",
     ) in dependency_edges
+
+
+def test_plan_adds_synergy_edges_for_related_structural_candidates() -> None:
+    duplicate = Candidate.model_validate(
+        {
+            **_candidate(
+                "duplicate-wrapper",
+                files=["src/shared.py"],
+                symbols=["wrapper", "second"],
+                apply_mode_hint="guarded",
+                scope="module",
+            ).model_dump(by_alias=True),
+            "kind": "duplicate_logic",
+            "anchorRegions": [
+                {"file": "src/shared.py", "startLine": 5, "endLine": 8},
+                {"file": "src/shared.py", "startLine": 20, "endLine": 23},
+            ],
+        }
+    )
+    extract = Candidate.model_validate(
+        {
+            **_candidate(
+                "extract-wrapper",
+                files=["src/shared.py"],
+                symbols=["wrapper"],
+                start_line=5,
+                end_line=30,
+                apply_mode_hint="guarded",
+            ).model_dump(by_alias=True),
+            "kind": "extract_function",
+        }
+    )
+    remove = Candidate.model_validate(
+        {
+            **_candidate(
+                "remove-wrapper",
+                files=["src/shared.py"],
+                symbols=["_wrapper"],
+                start_line=32,
+                end_line=35,
+                apply_mode_hint="guarded",
+                scope="module",
+            ).model_dump(by_alias=True),
+            "kind": "remove_abstraction",
+        }
+    )
+    split = Candidate.model_validate(
+        {
+            **_candidate(
+                "split-shared",
+                files=["src/shared.py"],
+                apply_mode_hint="report_only",
+                scope="module",
+            ).model_dump(by_alias=True),
+            "kind": "split_large_module",
+            "anchorRegions": [],
+        }
+    )
+    cycle = Candidate.model_validate(
+        {
+            **_candidate(
+                "cycle-shared",
+                files=["src/shared.py", "src/other.py"],
+                symbols=["pkg.shared", "pkg.other"],
+                apply_mode_hint="report_only",
+                scope="package",
+            ).model_dump(by_alias=True),
+            "kind": "reduce_cycle",
+            "anchorRegions": [],
+        }
+    )
+
+    result = build_plan(
+        mode="report",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[duplicate, extract, remove, split, cycle],
+    )
+
+    synergy_edges = {
+        (frozenset((edge.from_id, edge.to_id)), edge.reason)
+        for edge in result.edges
+        if edge.kind == "synergy"
+    }
+    assert (
+        frozenset(("duplicate-wrapper", "extract-wrapper")),
+        "duplicate consolidation and extraction reinforce the same file refactor",
+    ) in synergy_edges
+    assert (
+        frozenset(("duplicate-wrapper", "remove-wrapper")),
+        "duplicate cleanup pairs with removing thin wrappers in the same file",
+    ) in synergy_edges
+    assert (
+        frozenset(("split-shared", "cycle-shared")),
+        "cycle reduction and module splitting reinforce the same structural cleanup",
+    ) in synergy_edges
 
 
 def test_emitted_candidate_serialization_covers_full_floor(tmp_path: Path) -> None:

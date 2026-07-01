@@ -13,7 +13,7 @@ PlanMode = Literal["safe", "balanced", "report"]
 class PlanEdge(BaseModel):
     from_id: str = Field(alias="fromId")
     to_id: str = Field(alias="toId")
-    kind: Literal["conflict", "dependency"]
+    kind: Literal["conflict", "dependency", "synergy"]
     reason: str
 
 

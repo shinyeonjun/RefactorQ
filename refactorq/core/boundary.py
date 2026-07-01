@@ -36,6 +36,15 @@ _PATH_TOKEN_BOUNDARY_TYPES: dict[str, BoundaryType] = {
 
 _PRODUCER_TOKENS = {"api", "apis", "route", "routes", "controller", "controllers", "backend", "server"}
 _CONSUMER_TOKENS = {"client", "clients", "frontend", "web", "sdk"}
+_CONTRACT_PRESERVING_KINDS = {"extract_function", "duplicate_logic", "remove_abstraction"}
+
+
+def _is_low_impact_contract_preserving_candidate(candidate: Candidate) -> bool:
+    return (
+        candidate.kind in _CONTRACT_PRESERVING_KINDS
+        and len(candidate.files) == 1
+        and candidate.scope in {"local", "module"}
+    )
 
 
 def enrich_boundary_candidates(repo: RepoSnapshot, candidates: list[Candidate]) -> list[Candidate]:
@@ -127,7 +136,10 @@ def _enrich_candidate(repo: RepoSnapshot, candidate: Candidate) -> Candidate:
     )
     impact_level = candidate.boundary_impact.impact_level
     if cross_language and impact_level == "none":
-        impact_level = "medium" if candidate.apply_mode_hint != "auto" or candidate.scope != "local" else "low"
+        if candidate.apply_mode_hint == "auto" or _is_low_impact_contract_preserving_candidate(candidate):
+            impact_level = "low"
+        else:
+            impact_level = "medium"
 
     normalized_contract_artifacts = sorted(set(contract_artifacts)) if cross_language else []
     normalized_boundary_types = sorted(boundary_types)

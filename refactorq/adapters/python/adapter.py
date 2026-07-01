@@ -43,6 +43,34 @@ def _duplicate_function_key(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str
     return f"{args_dump}|{body_dump}"
 
 
+def _passthrough_target(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    if node.decorator_list or len(node.body) != 1:
+        return None
+    if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
+        return None
+    statement = node.body[0]
+    if not isinstance(statement, ast.Return) or statement.value is None:
+        return None
+    value = statement.value
+    if isinstance(value, ast.Await):
+        value = value.value
+    if not isinstance(value, ast.Call) or value.keywords:
+        return None
+    if len(value.args) != len(node.args.args):
+        return None
+    parameter_names = [argument.arg for argument in node.args.args]
+    forwarded_names: list[str] = []
+    for argument in value.args:
+        if not isinstance(argument, ast.Name):
+            return None
+        forwarded_names.append(argument.id)
+    if forwarded_names != parameter_names:
+        return None
+    if not isinstance(value.func, ast.Name) or value.func.id == node.name:
+        return None
+    return value.func.id
+
+
 def _build_duplicate_candidates(
     rel_path: str,
     duplicates: list[tuple[str, int, int, str]],
@@ -104,6 +132,61 @@ def _build_duplicate_candidates(
                 provenance=Provenance(
                     detectors=["python-ast-duplicate-function"],
                     evidence=[f"symbol:{name}" for name in symbols] + [f"duplicateGroupSize:{len(functions)}"],
+                ),
+            )
+        )
+    return candidates
+
+
+def _build_remove_abstraction_candidates(
+    rel_path: str,
+    passthrough_functions: list[tuple[str, int, int, str]],
+) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    for name, start_line, end_line, target_name in passthrough_functions:
+        length = end_line - start_line + 1
+        candidates.append(
+            Candidate(
+                id=f"py-remove-abstraction-{rel_path}-{start_line}-{name}",
+                kind="remove_abstraction",
+                title=f"Inline thin wrapper {name}",
+                description=(
+                    f"Private wrapper `{name}` in {rel_path} only forwards to `{target_name}` and is a"
+                    " candidate for inlining or removal"
+                ),
+                language="python",
+                scope="module",
+                source=["static", "metric"],
+                files=[rel_path],
+                symbols=[name],
+                anchorRegions=[_region(rel_path, start_line, end_line)],
+                estimatedBenefit=_benefit(
+                    {
+                        "complexityReduction": min(1.0, length / max(LONG_FUNCTION_THRESHOLD, 1)),
+                        "maintainabilityGain": 0.26,
+                    }
+                ),
+                estimatedRisk=_risk(
+                    {
+                        "semanticRisk": 0.2,
+                        "apiRisk": 0.08,
+                        "testRisk": 0.18,
+                        "conflictRisk": 0.12,
+                    }
+                ),
+                estimatedDiff=_diff(
+                    {
+                        "filesTouched": 1,
+                        "linesAdded": max(1, length // 3),
+                        "linesModified": length,
+                    }
+                ),
+                confidence=0.74,
+                applyModeHint="guarded",
+                requiredChecks=["parse", "lint", "typecheck", "unit_test"],
+                provenance=Provenance(
+                    detectors=["python-ast-passthrough-wrapper"],
+                    evidence=[f"symbol:{name}", f"target:{target_name}", f"line_span:{length}"],
                 ),
             )
         )
@@ -313,6 +396,7 @@ class PythonAdapter:
         imports: set[str] = set()
         candidates: list[Candidate] = []
         duplicate_functions: list[tuple[str, int, int, str]] = []
+        passthrough_functions: list[tuple[str, int, int, str]] = []
         top_level_statements = len(tree.body)
         if len(lines) >= LARGE_MODULE_THRESHOLD or top_level_statements >= TOP_LEVEL_STATEMENT_THRESHOLD:
             candidates.append(
@@ -397,6 +481,9 @@ class PythonAdapter:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.end_lineno is not None:
                 length = node.end_lineno - node.lineno + 1
                 duplicate_functions.append((node.name, node.lineno, node.end_lineno, _duplicate_function_key(node)))
+                passthrough_target = _passthrough_target(node)
+                if passthrough_target and node.name.startswith("_") and not node.name.startswith("__") and node.name not in exported_names:
+                    passthrough_functions.append((node.name, node.lineno, node.end_lineno, passthrough_target))
                 if length < LONG_FUNCTION_THRESHOLD:
                     continue
                 candidates.append(
@@ -484,4 +571,5 @@ class PythonAdapter:
             )
 
         candidates.extend(_build_duplicate_candidates(rel_path, duplicate_functions))
+        candidates.extend(_build_remove_abstraction_candidates(rel_path, passthrough_functions))
         return candidates, imports

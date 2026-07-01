@@ -26,7 +26,7 @@ _OUTPUT_SCHEMA = {
     "required": ["status", "touchedFiles", "summary", "details"],
 }
 
-_SUPPORTED_KINDS = {"duplicate_logic", "extract_function"}
+_SUPPORTED_KINDS = {"duplicate_logic", "extract_function", "remove_abstraction"}
 _SUPPORTED_LANGUAGES = {"python", "typescript", "javascript"}
 
 
@@ -40,7 +40,7 @@ class CodexGuardedApplier:
         if not self.is_available():
             return "codex cli is not available"
         if candidate.kind not in _SUPPORTED_KINDS:
-            return "guarded Codex flow currently supports extract_function and duplicate_logic only"
+            return "guarded Codex flow currently supports extract_function, duplicate_logic, and remove_abstraction only"
         if candidate.language not in _SUPPORTED_LANGUAGES:
             return "candidate language is not supported by guarded Codex flow"
         if len(candidate.files) != 1:
@@ -59,6 +59,12 @@ class CodexGuardedApplier:
                 return "guarded Codex flow currently supports local or module duplicate_logic candidates only"
             if len(candidate.anchor_regions) < 2 or len(candidate.symbols) < 2:
                 return "duplicate_logic candidate must target at least two regions and two symbols"
+            return None
+        if candidate.kind == "remove_abstraction":
+            if candidate.scope not in {"local", "module"}:
+                return "guarded Codex flow currently supports local or module remove_abstraction candidates only"
+            if len(candidate.anchor_regions) != 1 or len(candidate.symbols) != 1:
+                return "remove_abstraction candidate does not target a single region and symbol"
             return None
         return "candidate kind is not supported by guarded Codex flow"
 
@@ -125,6 +131,11 @@ class CodexGuardedApplier:
             preferred_implementation = (
                 "consolidate the duplicate logic into a shared local helper or a single canonical implementation"
                 " while preserving every public or top-level call site behavior."
+            )
+        if candidate.kind == "remove_abstraction":
+            preferred_implementation = (
+                "remove or inline the thin wrapper abstraction, keeping behavior and public interfaces stable"
+                " while simplifying same-file call paths."
             )
         return (
             "You are applying one guarded refactoring candidate inside an existing repository.\n"

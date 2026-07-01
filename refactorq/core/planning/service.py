@@ -65,6 +65,14 @@ def _is_unsupported_worker_guess(candidate: Candidate) -> bool:
     return any(detector.startswith("typescript-bridge") for detector in candidate.provenance.detectors)
 
 
+def _is_contract_preserving_cross_language_candidate(candidate: Candidate) -> bool:
+    return (
+        candidate.kind in {"extract_function", "duplicate_logic", "remove_abstraction"}
+        and len(candidate.files) == 1
+        and candidate.scope in {"local", "module"}
+    )
+
+
 def _safe_filter(candidate: Candidate) -> str | None:
     if candidate.apply_mode_hint != "auto":
         return "requires guarded or report-only handling"
@@ -85,8 +93,10 @@ def _balanced_filter(candidate: Candidate) -> str | None:
     if _is_cross_language(candidate):
         if candidate.boundary_impact.impact_level != "low":
             return "cross-language candidate requires lower boundary impact before balanced execution"
-        if candidate.apply_mode_hint != "auto":
+        if candidate.apply_mode_hint == "guarded" and not _is_contract_preserving_cross_language_candidate(candidate):
             return "guarded cross-language candidate retained as report until guarded boundary execution is stronger"
+        if candidate.apply_mode_hint not in {"auto", "guarded"}:
+            return "cross-language candidate is not execution-ready in balanced mode"
         if not _has_required_checks(candidate):
             return "cross-language candidate is missing required checks"
     if _is_unsupported_worker_guess(candidate):
@@ -194,6 +204,47 @@ def _dependency_edge(from_candidate: Candidate, to_candidate: Candidate, reason:
     return PlanEdge(fromId=from_candidate.id, toId=to_candidate.id, kind="dependency", reason=reason)
 
 
+def _synergy_edge(left: Candidate, right: Candidate, reason: str) -> PlanEdge:
+    first_id, second_id = sorted((left.id, right.id))
+    return PlanEdge(fromId=first_id, toId=second_id, kind="synergy", reason=reason)
+
+
+def _is_duplicate_extract_synergy(left: Candidate, right: Candidate) -> bool:
+    kinds = {left.kind, right.kind}
+    return kinds == {"duplicate_logic", "extract_function"} and bool(set(left.files) & set(right.files))
+
+
+def _is_duplicate_remove_abstraction_synergy(left: Candidate, right: Candidate) -> bool:
+    kinds = {left.kind, right.kind}
+    return kinds == {"duplicate_logic", "remove_abstraction"} and bool(set(left.files) & set(right.files))
+
+
+def _is_cycle_split_synergy(left: Candidate, right: Candidate) -> bool:
+    kinds = {left.kind, right.kind}
+    return kinds == {"reduce_cycle", "split_large_module"} and bool(set(left.files) & set(right.files))
+
+
+def _synergy_edges(candidates: list[Candidate]) -> list[PlanEdge]:
+    edges: list[PlanEdge] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_edge(left: Candidate, right: Candidate, reason: str) -> None:
+        edge = _synergy_edge(left, right, reason)
+        key = (edge.from_id, edge.to_id, edge.reason)
+        if key not in seen:
+            seen.add(key)
+            edges.append(edge)
+
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1 :]:
+            if _is_duplicate_extract_synergy(left, right):
+                add_edge(left, right, "duplicate consolidation and extraction reinforce the same file refactor")
+            if _is_duplicate_remove_abstraction_synergy(left, right):
+                add_edge(left, right, "duplicate cleanup pairs with removing thin wrappers in the same file")
+            if _is_cycle_split_synergy(left, right):
+                add_edge(left, right, "cycle reduction and module splitting reinforce the same structural cleanup")
+    return edges
+
 
 def _dependency_edges(candidates: list[Candidate]) -> list[PlanEdge]:
     by_id = {candidate.id: candidate for candidate in candidates}
@@ -233,6 +284,7 @@ def build_plan(*, mode: PlanMode, repo: RepoSnapshot, adapter_names: list[str], 
     selected, excluded = _filter_candidates(candidates, mode)
     edges = _conflict_edges(selected)
     edges.extend(_dependency_edges(selected))
+    edges.extend(_synergy_edges(selected))
     ordered_edges = sorted(edges, key=lambda edge: (edge.kind, edge.from_id, edge.to_id, edge.reason))
     return PlanResult(
         mode=mode,

@@ -117,6 +117,42 @@ def test_balanced_apply_uses_guarded_codex_flow(tmp_path: Path, monkeypatch: Mon
     assert "_very_long_function_impl" in sample.read_text(encoding="utf-8")
 
 
+def test_balanced_run_executes_low_impact_cross_language_guarded_candidate(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\n", encoding="utf-8")
+    sample = backend / "api.py"
+    sample.write_text(_long_python_function(), encoding="utf-8")
+    (frontend / "client.ts").write_text("console.log('ok');\n", encoding="utf-8")
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.is_available", lambda self: True)
+
+    def fake_apply(self: CodexGuardedApplier, root: Path, candidate: Candidate) -> GuardedApplyResult:
+        target = root / candidate.files[0]
+        target.write_text(
+            "def _very_long_function_impl():\n    return 39\n\n\n"
+            "def very_long_function():\n    return _very_long_function_impl()\n",
+            encoding="utf-8",
+        )
+        return GuardedApplyResult(
+            status="applied",
+            touchedFiles=[candidate.files[0]],
+            summary=["extracted helper in boundary-adjacent file"],
+            details={"candidate": candidate.id},
+        )
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
+
+    result = RefactorQService().run(tmp_path, "balanced")
+
+    assert result.status == "passed"
+    assert [candidate.kind for candidate in result.apply.applied_candidates] == ["extract_function"]
+    assert any(check.name == "boundary_contracts" and check.status == "passed" for check in result.verification.checks)
+    assert "_very_long_function_impl" in sample.read_text(encoding="utf-8")
+
+
 def test_balanced_apply_executes_low_impact_cross_language_auto_candidate(tmp_path: Path) -> None:
     backend = tmp_path / "backend"
     frontend = tmp_path / "frontend"
@@ -133,6 +169,40 @@ def test_balanced_apply_executes_low_impact_cross_language_auto_candidate(tmp_pa
     assert [candidate.id for candidate in result.apply.applied_candidates] == ["py-unused-import-backend/api.py-1-os"]
     assert any(check.name == "boundary_contracts" and check.status == "passed" for check in result.verification.checks)
     assert sample.read_text(encoding="utf-8") == "\nprint('ok')\n"
+
+
+def test_balanced_apply_uses_guarded_remove_abstraction_flow(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "def normalize(value):\n    return value.strip().lower()\n\n"
+        "def _normalize_wrapper(value):\n    return normalize(value)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.is_available", lambda self: True)
+
+    def fake_apply(self: CodexGuardedApplier, root: Path, candidate: Candidate) -> GuardedApplyResult:
+        target = root / candidate.files[0]
+        target.write_text(
+            "def normalize(value):\n    return value.strip().lower()\n\n"
+            "def format_value(value):\n    return normalize(value)\n",
+            encoding="utf-8",
+        )
+        return GuardedApplyResult(
+            status="applied",
+            touchedFiles=[candidate.files[0]],
+            summary=["removed thin wrapper abstraction"],
+            details={"candidate": candidate.id},
+        )
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
+
+    result = RefactorQService().apply(tmp_path, "balanced")
+
+    assert result.status == "applied"
+    assert result.changed_files == ["sample.py"]
+    assert "remove_abstraction" in [candidate.kind for candidate in result.applied_candidates]
+    assert "_normalize_wrapper" not in sample.read_text(encoding="utf-8")
 
 
 def test_balanced_apply_uses_guarded_duplicate_logic_flow(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

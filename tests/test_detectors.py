@@ -28,6 +28,19 @@ def test_python_adapter_detects_private_dead_code(tmp_path: Path) -> None:
     assert any(candidate.kind == "dead_code" and candidate.symbols == ["_helper"] for candidate in candidates)
 
 
+def test_python_adapter_detects_remove_abstraction_candidate(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "def normalize(value):\n    return value.strip().lower()\n\n"
+        "def _normalize_wrapper(value):\n    return normalize(value)\n",
+        encoding="utf-8",
+    )
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "remove_abstraction" and candidate.symbols == ["_normalize_wrapper"] for candidate in candidates)
+
+
 def test_python_adapter_detects_large_module_candidate(tmp_path: Path) -> None:
     sample = tmp_path / "large_module.py"
     sample.write_text("\n".join([f"value_{index} = {index}" for index in range(20)]), encoding="utf-8")
@@ -253,6 +266,28 @@ def test_ts_worker_emits_unused_symbol_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "unused_symbol" and candidate["symbols"] == ["helper"] for candidate in payload["candidates"])
+
+def test_ts_worker_emits_remove_abstraction_candidates(tmp_path: Path) -> None:
+    (tmp_path / "wrapper.ts").write_text(
+        "function normalize(value: string) {\n  return value.trim().toLowerCase();\n}\n\n"
+        "function _normalizeWrapper(value: string) {\n  return normalize(value);\n}\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "remove_abstraction" and candidate["symbols"] == ["_normalizeWrapper"] for candidate in payload["candidates"])
 
 def test_ts_worker_emits_large_module_candidates(tmp_path: Path) -> None:
     statements = [f"const value{index} = {index};" for index in range(20)]
