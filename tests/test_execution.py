@@ -345,6 +345,23 @@ def test_verify_reports_boundary_contract_check_for_mixed_repo(tmp_path: Path) -
     assert "openapi.yaml" in boundary_check.evidence[0]
 
 
+def test_verify_fails_on_invalid_json_boundary_artifact(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "schema.json").write_text("{not-json}\n", encoding="utf-8")
+    (backend / "api.py").write_text("print('ok')\n", encoding="utf-8")
+    (frontend / "client.ts").write_text("console.log('ok');\n", encoding="utf-8")
+
+    result = RefactorQService().verify(tmp_path)
+
+    assert result.status == "failed"
+    boundary_check = next(check for check in result.checks if check.name == "boundary_contracts")
+    assert boundary_check.status == "failed"
+    assert "schema.json" in boundary_check.evidence[0]
+
+
 def test_verify_runs_python_toolchain_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "pkg.py"
     sample.write_text("print('ok')\n", encoding="utf-8")

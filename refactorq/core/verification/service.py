@@ -45,20 +45,62 @@ def _verify_boundary_contracts(root: Path) -> VerificationCheckResult:
             evidence=["single-language repository; no cross-language boundary contract check required"],
             details={"mixedLanguage": False, "artifactCount": len(repo.boundary_artifacts)},
         )
-    if repo.boundary_artifacts:
+
+    if not repo.boundary_artifacts:
         return VerificationCheckResult(
             name="boundary_contracts",
             kind="build",
-            status="passed",
-            evidence=[f"detected boundary artifacts: {', '.join(repo.boundary_artifacts)}"],
-            details={"mixedLanguage": True, "artifactCount": len(repo.boundary_artifacts)},
+            status="skipped",
+            evidence=["mixed-language repository detected but no explicit boundary contract artifacts were found"],
+            details={"mixedLanguage": True, "artifactCount": 0},
         )
+
+    checked = 0
+    failures: list[str] = []
+    evidence: list[str] = []
+    for artifact in repo.boundary_artifacts:
+        checked += 1
+        path = root / artifact
+        suffix = path.suffix.lower()
+        content = path.read_text(encoding="utf-8")
+        if suffix == ".json":
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                failures.append(f"{artifact}:{exc.lineno}:{exc.colno} invalid JSON boundary artifact")
+                continue
+            evidence.append(f"validated JSON boundary artifact: {artifact}")
+            continue
+        if path.name == ".env.example":
+            invalid_lines = [
+                f"line {index + 1}"
+                for index, line in enumerate(content.splitlines())
+                if line.strip() and not line.lstrip().startswith("#") and "=" not in line
+            ]
+            if invalid_lines:
+                failures.append(f"{artifact} invalid env assignment format at {', '.join(invalid_lines[:5])}")
+                continue
+            evidence.append(f"validated env boundary artifact: {artifact}")
+            continue
+        if path.name in {"openapi.yaml", "openapi.yml"}:
+            if "openapi:" not in content and "swagger:" not in content:
+                failures.append(f"{artifact} does not look like an OpenAPI or Swagger document")
+                continue
+            evidence.append(f"validated OpenAPI boundary artifact marker: {artifact}")
+            continue
+        evidence.append(f"detected boundary artifact: {artifact}")
+
     return VerificationCheckResult(
         name="boundary_contracts",
         kind="build",
-        status="skipped",
-        evidence=["mixed-language repository detected but no explicit boundary contract artifacts were found"],
-        details={"mixedLanguage": True, "artifactCount": 0},
+        status="failed" if failures else "passed",
+        evidence=failures[:20] if failures else evidence,
+        details={
+            "mixedLanguage": True,
+            "artifactCount": len(repo.boundary_artifacts),
+            "checkedArtifactCount": checked,
+            "failureCount": len(failures),
+        },
     )
 
 
