@@ -19,7 +19,7 @@ def test_python_adapter_detects_unused_import(tmp_path: Path) -> None:
     assert any(candidate.kind == "unused_import" for candidate in candidates)
 
 
-def test_typescript_adapter_sorts_worker_candidates_deterministically(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "sample.ts"
     sample.write_text('import { readFile } from "node:fs";\n\nconsole.log("hi");\n', encoding="utf-8")
 
@@ -72,7 +72,7 @@ def test_typescript_adapter_sorts_worker_candidates_deterministically(tmp_path: 
 
     candidates = TypeScriptAdapter().scan(tmp_path)
 
-    assert [candidate.files[0] for candidate in candidates] == ["alpha.ts", "zeta.ts"]
+    assert [candidate.files[0] for candidate in candidates] == ["zeta.ts", "alpha.ts"]
 
 
 def test_typescript_adapter_reports_worker_contract_failures(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -131,3 +131,6 @@ def test_ts_worker_emits_protocol_version_and_sorted_candidates(tmp_path: Path) 
     assert payload["ok"] is True
     assert payload["capabilities"] == PROTOCOL_CAPABILITIES
     assert [candidate["files"][0] for candidate in payload["candidates"]] == ["alpha.ts", "zeta.ts"]
+    first_candidate = payload["candidates"][0]
+    for key in ["contextSignals", "boundaryImpact", "dependencies", "conflicts"]:
+        assert key in first_candidate

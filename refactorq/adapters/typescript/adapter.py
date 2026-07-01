@@ -109,7 +109,7 @@ class TypeScriptAdapter:
                 )
             ]
 
-        return sorted(candidates, key=lambda candidate: (candidate.files, candidate.id))
+        return candidates
 
     def _invoke_worker(self, root: Path) -> object:
         request = WorkerScanRequest(protocolVersion=PROTOCOL_VERSION, command="scan", root=str(root.resolve()))

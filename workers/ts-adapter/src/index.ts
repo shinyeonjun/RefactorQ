@@ -17,6 +17,29 @@ const IGNORED = new Set([
   "coverage",
 ]);
 const SUPPORTED_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
+function createEmptyContextSignals() {
+  return {
+    coverageRatio: null,
+    hotspotScore: null,
+    churnScore: null,
+    fanIn: null,
+    fanOut: null,
+    publicApiExposure: false,
+    benchmarkAvailable: false,
+  };
+}
+
+function createEmptyBoundaryImpact() {
+  return {
+    crossLanguage: false,
+    boundaryTypes: [] as string[],
+    producerSide: [] as string[],
+    consumerSide: [] as string[],
+    contractArtifacts: [] as string[],
+    impactLevel: "none" as const,
+  };
+}
+
 
 type WorkerRequest = {
   protocolVersion: number;
@@ -73,9 +96,28 @@ type CandidatePayload = {
     linesDeleted?: number;
     linesModified: number;
   };
+  contextSignals: {
+    coverageRatio: null;
+    hotspotScore: null;
+    churnScore: null;
+    fanIn: null;
+    fanOut: null;
+    publicApiExposure: boolean;
+    benchmarkAvailable: boolean;
+  };
+  boundaryImpact: {
+    crossLanguage: boolean;
+    boundaryTypes: string[];
+    producerSide: string[];
+    consumerSide: string[];
+    contractArtifacts: string[];
+    impactLevel: "none" | "low" | "medium" | "high";
+  };
   confidence: number;
   applyModeHint: "auto" | "guarded";
   requiredChecks: Array<"parse" | "lint" | "typecheck" | "unit_test">;
+  dependencies: string[];
+  conflicts: string[];
   provenance: {
     detectors: string[];
     evidence: string[];
@@ -209,9 +251,13 @@ function buildUnusedImportCandidates(
       estimatedBenefit: { maintainabilityGain: 0.08 },
       estimatedRisk: { semanticRisk: 0.02, conflictRisk: 0.03 },
       estimatedDiff: { filesTouched: 1, linesDeleted: 1, linesModified: 1 },
+      contextSignals: createEmptyContextSignals(),
+      boundaryImpact: createEmptyBoundaryImpact(),
       confidence: 0.9,
       applyModeHint: "auto",
       requiredChecks: ["parse", "lint", "typecheck"],
+      dependencies: [],
+      conflicts: [],
       provenance: {
         detectors: ["ts-worker-unused-import"],
         evidence: [`line:${binding.line}`, `symbol:${binding.name}`],
@@ -251,9 +297,13 @@ function buildLongFunctionCandidates(sourceFile: ts.SourceFile, root: string): C
             linesAdded: Math.max(3, Math.floor(length / 4)),
             linesModified: length,
           },
+          contextSignals: createEmptyContextSignals(),
+          boundaryImpact: createEmptyBoundaryImpact(),
           confidence: 0.68,
           applyModeHint: "guarded",
           requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+          dependencies: [],
+          conflicts: [],
           provenance: {
             detectors: ["ts-worker-long-function"],
             evidence: [`line_span:${length}`, `symbol:${node.name.text}`],
