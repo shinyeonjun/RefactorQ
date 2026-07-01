@@ -8,8 +8,10 @@ const LONG_FUNCTION_THRESHOLD = 40;
 const LARGE_MODULE_THRESHOLD = 300;
 const DUPLICATE_FUNCTION_MIN_LINES = 3;
 const TOP_LEVEL_STATEMENT_THRESHOLD = 18;
+const INLINE_FUNCTION_MAX_LINES = 8;
 const IGNORED = new Set([
   ".git",
+  ".gjc",
   ".venv",
   "node_modules",
   "dist",
@@ -43,6 +45,17 @@ function createEmptyBoundaryImpact() {
     consumerSide: [] as string[],
     contractArtifacts: [] as string[],
     impactLevel: "none" as const,
+  };
+}
+
+function createLayerBoundaryImpact(producerSide: string[], consumerSide: string[]) {
+  return {
+    crossLanguage: false,
+    boundaryTypes: [] as string[],
+    producerSide,
+    consumerSide,
+    contractArtifacts: [] as string[],
+    impactLevel: "medium" as const,
   };
 }
 
@@ -98,7 +111,7 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle" | "layer_violation_fix" | "move_symbol";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "inline_function" | "duplicate_logic" | "remove_abstraction" | "split_large_module" | "reduce_cycle" | "layer_violation_fix" | "move_symbol";
 
   title: string;
   description: string;
@@ -194,8 +207,12 @@ function createProgram(rootArg: string): { root: string; files: string[]; progra
     checkJs: false,
     noEmit: true,
     target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    esModuleInterop: true,
+    allowSyntheticDefaultImports: true,
     jsx: ts.JsxEmit.Preserve,
+    skipLibCheck: true,
   });
   return { root, files, program };
 }
@@ -222,44 +239,101 @@ function lineSpan(sourceFile: ts.SourceFile, node: ts.Node): { startLine: number
   return { startLine, endLine, length: endLine - startLine + 1 };
 }
 
-function duplicateFunctionKey(sourceFile: ts.SourceFile, node: ts.FunctionDeclaration): string | null {
-  if (!node.body) {
+type TopLevelFunctionLike = {
+  nameNode: ts.Identifier;
+  declaration: ts.Statement;
+  functionNode: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction;
+};
+
+function collectTopLevelFunctionLikes(sourceFile: ts.SourceFile): TopLevelFunctionLike[] {
+  const entries: TopLevelFunctionLike[] = [];
+  for (const statement of sourceFile.statements) {
+    if (ts.isFunctionDeclaration(statement) && statement.name && statement.body) {
+      entries.push({ nameNode: statement.name, declaration: statement, functionNode: statement });
+      continue;
+    }
+    if (!ts.isVariableStatement(statement) || !(statement.declarationList.flags & ts.NodeFlags.Const)) {
+      continue;
+    }
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+        continue;
+      }
+      if (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer)) {
+        entries.push({
+          nameNode: declaration.name,
+          declaration: statement,
+          functionNode: declaration.initializer,
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+function duplicateFunctionKey(sourceFile: ts.SourceFile, entry: TopLevelFunctionLike): string | null {
+  const functionBody = entry.functionNode.body;
+  if (!functionBody) {
     return null;
   }
-  const parameters = node.parameters.map((parameter) => parameter.getText(sourceFile).replace(/\s+/g, " ").trim()).join(",");
-  const body = node.body.statements.map((statement) => statement.getText(sourceFile).replace(/\s+/g, " ").trim()).join(";");
+  const parameters = entry.functionNode.parameters.map((parameter) => parameter.getText(sourceFile).replace(/\s+/g, " ").trim()).join(",");
+  const body = ts.isBlock(functionBody)
+    ? functionBody.statements.map((statement) => statement.getText(sourceFile).replace(/\s+/g, " ").trim()).join(";")
+    : functionBody.getText(sourceFile).replace(/\s+/g, " ").trim();
   if (!body) {
     return null;
   }
   return `${parameters}|${body}`;
 }
 
-function passthroughTarget(node: ts.FunctionDeclaration): string | null {
-  if (!node.name || !node.body || node.body.statements.length !== 1 || isExportedNode(node)) {
+function passthroughTarget(entry: TopLevelFunctionLike): string | null {
+  if (isExportedNode(entry.declaration)) {
     return null;
   }
-  const [statement] = node.body.statements;
-  if (!statement || !ts.isReturnStatement(statement) || !statement.expression || !ts.isCallExpression(statement.expression)) {
+  const functionBody = entry.functionNode.body;
+  if (!functionBody) {
     return null;
   }
-  if (!ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text === node.name.text) {
+  let expression: ts.Expression;
+  if (ts.isBlock(functionBody)) {
+    if (functionBody.statements.length !== 1) {
+      return null;
+    }
+    const [statement] = functionBody.statements;
+    if (!statement || !ts.isReturnStatement(statement) || !statement.expression) {
+      return null;
+    }
+    expression = statement.expression;
+  } else {
+    expression = functionBody;
+  }
+  if (ts.isParenthesizedExpression(expression)) {
+    expression = expression.expression;
+  }
+  if (ts.isAwaitExpression(expression)) {
+    expression = expression.expression;
+  }
+  if (!ts.isCallExpression(expression)) {
     return null;
   }
-  if (statement.expression.arguments.length !== node.parameters.length) {
+  if (!ts.isIdentifier(expression.expression) || expression.expression.text === entry.nameNode.text) {
     return null;
   }
-  const parameterNames = node.parameters.map((parameter) => ts.isIdentifier(parameter.name) ? parameter.name.text : null);
+  if (expression.arguments.length !== entry.functionNode.parameters.length) {
+    return null;
+  }
+  const parameterNames = entry.functionNode.parameters.map((parameter) => ts.isIdentifier(parameter.name) ? parameter.name.text : null);
   if (parameterNames.some((name) => name === null)) {
     return null;
   }
-  const forwardedNames = statement.expression.arguments.map((argument) => ts.isIdentifier(argument) ? argument.text : null);
+  const forwardedNames = expression.arguments.map((argument) => ts.isIdentifier(argument) ? argument.text : null);
   if (forwardedNames.some((name) => name === null)) {
     return null;
   }
   if (parameterNames.join(",") !== forwardedNames.join(",")) {
     return null;
   }
-  return statement.expression.expression.text;
+  return expression.expression.text;
 }
 
 function isImportedIdentifier(node: ts.Identifier): boolean {
@@ -299,36 +373,53 @@ function countSymbolReferences(checker: ts.TypeChecker, sourceFile: ts.SourceFil
 }
 
 
+function _unusedImportApplyMode(sourceFile: ts.SourceFile, declaration: ts.ImportDeclaration, bindingLine: number): "auto" | "report_only" {
+  const startLine = sourceFile.getLineAndCharacterOfPosition(declaration.getStart(sourceFile)).line + 1;
+  const endLine = sourceFile.getLineAndCharacterOfPosition(declaration.end).line + 1;
+  if (startLine !== endLine || bindingLine !== startLine) {
+    return "report_only";
+  }
+  const rawLine = sourceFile.text.split(/\r?\n/)[startLine - 1] ?? "";
+  const trimmed = rawLine.trim();
+  if (!trimmed.startsWith("import ") || trimmed.includes("/*") || trimmed.includes("*/") || trimmed.includes("//") || trimmed.includes("(") || trimmed.includes(")") || trimmed.includes("\\")) {
+    return "report_only";
+  }
+  return "auto";
+}
+
 function buildUnusedImportCandidates(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
   root: string,
 ): CandidatePayload[] {
   const relPath = relativePosix(root, sourceFile.fileName);
-  const imports: Array<{ name: string; line: number; symbol: ts.Symbol }> = [];
+  const imports: Array<{ name: string; line: number; symbol: ts.Symbol; declaration: ts.ImportDeclaration }> = [];
 
-  function collectImports(node: ts.Node): void {
-    if (ts.isImportClause(node) && node.name) {
+  function collectImports(node: ts.Node, currentImport: ts.ImportDeclaration | null = null): void {
+    const activeImport = ts.isImportDeclaration(node) ? node : currentImport;
+    if (ts.isImportClause(node) && node.name && activeImport) {
       const symbol = checker.getSymbolAtLocation(node.name);
       if (symbol) {
         imports.push({
           name: node.name.text,
           line: sourceFile.getLineAndCharacterOfPosition(node.name.getStart()).line + 1,
           symbol,
+          declaration: activeImport,
         });
       }
     }
-    if (ts.isNamespaceImport(node)) {
+    if (ts.isNamespaceImport(node) && activeImport) {
       const symbol = checker.getSymbolAtLocation(node.name);
       if (symbol) {
         imports.push({
           name: node.name.text,
           line: sourceFile.getLineAndCharacterOfPosition(node.name.getStart()).line + 1,
           symbol,
+          declaration: activeImport,
         });
       }
     }
-    if (ts.isImportSpecifier(node)) {
+    if (ts.isImportSpecifier(node) && activeImport) {
       const binding = node.name;
       const symbol = checker.getSymbolAtLocation(binding);
       if (symbol) {
@@ -336,10 +427,11 @@ function buildUnusedImportCandidates(
           name: binding.text,
           line: sourceFile.getLineAndCharacterOfPosition(binding.getStart()).line + 1,
           symbol,
+          declaration: activeImport,
         });
       }
     }
-    ts.forEachChild(node, collectImports);
+    ts.forEachChild(node, (child) => collectImports(child, activeImport));
   }
 
   const usageCounts = countSymbolReferences(checker, sourceFile);
@@ -365,7 +457,7 @@ function buildUnusedImportCandidates(
       contextSignals: createEmptyContextSignals(),
       boundaryImpact: createEmptyBoundaryImpact(),
       confidence: 0.9,
-      applyModeHint: "auto",
+      applyModeHint: _unusedImportApplyMode(sourceFile, binding.declaration, binding.line),
       requiredChecks: ["parse", "lint", "typecheck"],
       dependencies: [],
       conflicts: [],
@@ -381,51 +473,46 @@ function buildLongFunctionCandidates(sourceFile: ts.SourceFile, root: string): C
   const totalLines = sourceFile.getLineAndCharacterOfPosition(sourceFile.end).line + 1;
   const candidates: CandidatePayload[] = [];
 
-  function visit(node: ts.Node): void {
-    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
-      const startLine = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
-      const endLine = sourceFile.getLineAndCharacterOfPosition(node.body.end).line + 1;
-      const length = endLine - startLine + 1;
-      if (length >= LONG_FUNCTION_THRESHOLD) {
-        candidates.push({
-          id: `ts-extract-function-${relPath}-${startLine}-${node.name.text}`,
-          kind: "extract_function",
-          title: `Extract logic from long function ${node.name.text}`,
-          description: `Function \`${node.name.text}\` in ${relPath} spans ${length} lines and is a candidate for extraction`,
-          language: "typescript",
-          scope: "local",
-          source: ["static", "metric"],
-          files: [relPath],
-          symbols: [node.name.text],
-          anchorRegions: [{ file: relPath, startLine, endLine }],
-          estimatedBenefit: {
-            complexityReduction: Math.min(1, length / Math.max(totalLines, 1)),
-            maintainabilityGain: 0.35,
-          },
-          estimatedRisk: { semanticRisk: 0.35, testRisk: 0.25, conflictRisk: 0.15 },
-          estimatedDiff: {
-            filesTouched: 1,
-            linesAdded: Math.max(3, Math.floor(length / 4)),
-            linesModified: length,
-          },
-          contextSignals: createEmptyContextSignals(),
-          boundaryImpact: createEmptyBoundaryImpact(),
-          confidence: 0.68,
-          applyModeHint: "guarded",
-          requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
-          dependencies: [],
-          conflicts: [],
-          provenance: {
-            detectors: ["ts-worker-long-function"],
-            evidence: [`line_span:${length}`, `symbol:${node.name.text}`],
-          },
-        });
-      }
+  for (const entry of collectTopLevelFunctionLikes(sourceFile)) {
+    const span = lineSpan(sourceFile, entry.declaration);
+    if (span.length < LONG_FUNCTION_THRESHOLD) {
+      continue;
     }
-    ts.forEachChild(node, visit);
+    candidates.push({
+      id: `ts-extract-function-${relPath}-${span.startLine}-${entry.nameNode.text}`,
+      kind: "extract_function",
+      title: `Extract logic from long function ${entry.nameNode.text}`,
+      description: `Function \`${entry.nameNode.text}\` in ${relPath} spans ${span.length} lines and is a candidate for extraction`,
+      language: "typescript",
+      scope: "local",
+      source: ["static", "metric"],
+      files: [relPath],
+      symbols: [entry.nameNode.text],
+      anchorRegions: [{ file: relPath, startLine: span.startLine, endLine: span.endLine }],
+      estimatedBenefit: {
+        complexityReduction: Math.min(1, span.length / Math.max(totalLines, 1)),
+        maintainabilityGain: 0.35,
+      },
+      estimatedRisk: { semanticRisk: 0.35, testRisk: 0.25, conflictRisk: 0.15 },
+      estimatedDiff: {
+        filesTouched: 1,
+        linesAdded: Math.max(3, Math.floor(span.length / 4)),
+        linesModified: span.length,
+      },
+      contextSignals: createEmptyContextSignals(),
+      boundaryImpact: createEmptyBoundaryImpact(),
+      confidence: 0.68,
+      applyModeHint: "guarded",
+      requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+      dependencies: [],
+      conflicts: [],
+      provenance: {
+        detectors: ["ts-worker-long-function"],
+        evidence: [`line_span:${span.length}`, `symbol:${entry.nameNode.text}`],
+      },
+    });
   }
 
-  visit(sourceFile);
   return candidates;
 }
 
@@ -476,22 +563,19 @@ function buildDuplicateFunctionCandidates(sourceFile: ts.SourceFile, root: strin
   const relPath = relativePosix(root, sourceFile.fileName);
   const groups = new Map<string, Array<{ name: string; startLine: number; endLine: number; length: number }>>();
 
-  for (const statement of sourceFile.statements) {
-    if (!ts.isFunctionDeclaration(statement) || !statement.name || !statement.body) {
-      continue;
-    }
-    const duplicateKey = duplicateFunctionKey(sourceFile, statement);
+  for (const entry of collectTopLevelFunctionLikes(sourceFile)) {
+    const duplicateKey = duplicateFunctionKey(sourceFile, entry);
     if (!duplicateKey) {
       continue;
     }
-    const span = lineSpan(sourceFile, statement);
-    const entry = {
-      name: statement.name.text,
+    const span = lineSpan(sourceFile, entry.declaration);
+    const groupEntry = {
+      name: entry.nameNode.text,
       startLine: span.startLine,
       endLine: span.endLine,
       length: span.length,
     };
-    groups.set(duplicateKey, [...(groups.get(duplicateKey) ?? []), entry]);
+    groups.set(duplicateKey, [...(groups.get(duplicateKey) ?? []), groupEntry]);
   }
 
   const candidates: CandidatePayload[] = [];
@@ -543,28 +627,25 @@ function buildRemoveAbstractionCandidates(sourceFile: ts.SourceFile, root: strin
   const relPath = relativePosix(root, sourceFile.fileName);
   const candidates: CandidatePayload[] = [];
 
-  for (const statement of sourceFile.statements) {
-    if (!ts.isFunctionDeclaration(statement) || !statement.name || statement.end === undefined) {
+  for (const entry of collectTopLevelFunctionLikes(sourceFile)) {
+    if (!entry.nameNode.text.startsWith("_")) {
       continue;
     }
-    if (!statement.name.text.startsWith("_")) {
-      continue;
-    }
-    const target = passthroughTarget(statement);
+    const target = passthroughTarget(entry);
     if (!target) {
       continue;
     }
-    const span = lineSpan(sourceFile, statement);
+    const span = lineSpan(sourceFile, entry.declaration);
     candidates.push({
-      id: `ts-remove-abstraction-${relPath}-${span.startLine}-${statement.name.text}`,
+      id: `ts-remove-abstraction-${relPath}-${span.startLine}-${entry.nameNode.text}`,
       kind: "remove_abstraction",
-      title: `Inline thin wrapper ${statement.name.text}`,
-      description: `Private TypeScript wrapper \`${statement.name.text}\` in ${relPath} only forwards to \`${target}\` and can likely be removed`,
+      title: `Inline thin wrapper ${entry.nameNode.text}`,
+      description: `Private TypeScript wrapper \`${entry.nameNode.text}\` in ${relPath} only forwards to \`${target}\` and can likely be removed`,
       language: "typescript",
       scope: "module",
       source: ["static", "metric"],
       files: [relPath],
-      symbols: [statement.name.text],
+      symbols: [entry.nameNode.text],
       anchorRegions: [{ file: relPath, startLine: span.startLine, endLine: span.endLine }],
       estimatedBenefit: {
         complexityReduction: Math.min(1, span.length / Math.max(LONG_FUNCTION_THRESHOLD, 1)),
@@ -585,7 +666,69 @@ function buildRemoveAbstractionCandidates(sourceFile: ts.SourceFile, root: strin
       conflicts: [],
       provenance: {
         detectors: ["ts-worker-passthrough-wrapper"],
-        evidence: [`symbol:${statement.name.text}`, `target:${target}`, `line_span:${span.length}`],
+        evidence: [`symbol:${entry.nameNode.text}`, `target:${target}`, `line_span:${span.length}`],
+      },
+    });
+  }
+
+  return candidates;
+}
+
+function buildInlineFunctionCandidates(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  root: string,
+): CandidatePayload[] {
+  const relPath = relativePosix(root, sourceFile.fileName);
+  const usageCounts = countSymbolReferences(checker, sourceFile);
+  const candidates: CandidatePayload[] = [];
+
+  for (const entry of collectTopLevelFunctionLikes(sourceFile)) {
+    if (!entry.nameNode.text.startsWith("_") || isExportedNode(entry.declaration)) {
+      continue;
+    }
+    if (passthroughTarget(entry)) {
+      continue;
+    }
+    const symbol = checker.getSymbolAtLocation(entry.nameNode);
+    if (!symbol || (usageCounts.get(symbol) ?? 0) !== 1) {
+      continue;
+    }
+    const span = lineSpan(sourceFile, entry.declaration);
+    if (span.length > INLINE_FUNCTION_MAX_LINES) {
+      continue;
+    }
+    candidates.push({
+      id: `ts-inline-function-${relPath}-${span.startLine}-${entry.nameNode.text}`,
+      kind: "inline_function",
+      title: `Inline single-use helper ${entry.nameNode.text}`,
+      description: `Private TypeScript helper \`${entry.nameNode.text}\` in ${relPath} is referenced only once and is a candidate for inlining into its caller`,
+      language: "typescript",
+      scope: "module",
+      source: ["static", "metric"],
+      files: [relPath],
+      symbols: [entry.nameNode.text],
+      anchorRegions: [{ file: relPath, startLine: span.startLine, endLine: span.endLine }],
+      estimatedBenefit: {
+        complexityReduction: Math.min(1, span.length / Math.max(INLINE_FUNCTION_MAX_LINES, 1)),
+        maintainabilityGain: 0.24,
+      },
+      estimatedRisk: { semanticRisk: 0.24, apiRisk: 0.06, testRisk: 0.18, conflictRisk: 0.1 },
+      estimatedDiff: {
+        filesTouched: 1,
+        linesAdded: Math.max(1, Math.floor(span.length / 2)),
+        linesModified: span.length,
+      },
+      contextSignals: createEmptyContextSignals(),
+      boundaryImpact: createEmptyBoundaryImpact(),
+      confidence: 0.72,
+      applyModeHint: "guarded",
+      requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+      dependencies: [],
+      conflicts: [],
+      provenance: {
+        detectors: ["ts-worker-single-use-helper"],
+        evidence: [`symbol:${entry.nameNode.text}`, "referenceCount:1", `line_span:${span.length}`],
       },
     });
   }
@@ -743,7 +886,7 @@ function buildLayerViolationCandidates(root: string, files: string[], program: t
         estimatedRisk: { semanticRisk: 0.22, apiRisk: 0.1, testRisk: 0.18, conflictRisk: 0.12 },
         estimatedDiff: { filesTouched: 2, linesAdded: 4, linesModified: 8 },
         contextSignals: createEmptyContextSignals(),
-        boundaryImpact: createEmptyBoundaryImpact(),
+        boundaryImpact: createLayerBoundaryImpact([targetRelPath], [relPath]),
         confidence: 0.69,
         applyModeHint: "report_only",
         requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
@@ -770,7 +913,7 @@ function buildLayerViolationCandidates(root: string, files: string[], program: t
           estimatedRisk: { semanticRisk: 0.28, apiRisk: 0.16, testRisk: 0.22, conflictRisk: 0.14 },
           estimatedDiff: { filesTouched: 2, linesAdded: 6, linesModified: 10 },
           contextSignals: createEmptyContextSignals(),
-          boundaryImpact: createEmptyBoundaryImpact(),
+          boundaryImpact: createLayerBoundaryImpact([targetRelPath], [relPath]),
           confidence: 0.64,
           applyModeHint: "report_only",
           requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
@@ -849,55 +992,169 @@ function buildCycleCandidates(root: string, files: string[], program: ts.Program
     });
 }
 
+function isSideEffectFreeInitializer(node: ts.Expression | undefined): boolean {
+  if (!node) {
+    return true;
+  }
+  if (
+    ts.isLiteralExpression(node)
+    || node.kind === ts.SyntaxKind.TrueKeyword
+    || node.kind === ts.SyntaxKind.FalseKeyword
+    || node.kind === ts.SyntaxKind.NullKeyword
+    || node.kind === ts.SyntaxKind.UndefinedKeyword
+    || ts.isNoSubstitutionTemplateLiteral(node)
+    || ts.isFunctionExpression(node)
+    || ts.isArrowFunction(node)
+    || ts.isClassExpression(node)
+  ) {
+    return true;
+  }
+  if (ts.isIdentifier(node)) {
+    return node.text === "undefined";
+  }
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node)) {
+    return isSideEffectFreeInitializer(node.expression);
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    return node.elements.every((element) => !ts.isSpreadElement(element) && (ts.isOmittedExpression(element) || isSideEffectFreeInitializer(element)));
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    return node.properties.every((property) => {
+      if (ts.isPropertyAssignment(property)) {
+        return isSideEffectFreeInitializer(property.initializer);
+      }
+      if (ts.isMethodDeclaration(property) || ts.isGetAccessorDeclaration(property) || ts.isSetAccessorDeclaration(property)) {
+        return true;
+      }
+      return false;
+    });
+  }
+  return false;
+}
+
+function pushUnusedSymbolCandidate(
+  candidates: CandidatePayload[],
+  args: {
+    relPath: string;
+    startLine: number;
+    endLine: number;
+    symbol: string;
+    description: string;
+  },
+): void {
+  const { relPath, startLine, endLine, symbol, description } = args;
+  const length = endLine - startLine + 1;
+  candidates.push({
+    id: `ts-unused-symbol-${relPath}-${startLine}-${symbol}`,
+    kind: "unused_symbol",
+    title: `Remove unused symbol ${symbol}`,
+    description,
+    language: "typescript",
+    scope: "module",
+    source: ["static"],
+    files: [relPath],
+    symbols: [symbol],
+    anchorRegions: [{ file: relPath, startLine, endLine }],
+    estimatedBenefit: { maintainabilityGain: 0.18 },
+    estimatedRisk: { semanticRisk: 0.08, conflictRisk: 0.04 },
+    estimatedDiff: { filesTouched: 1, linesDeleted: length, linesModified: length },
+    contextSignals: createEmptyContextSignals(),
+    boundaryImpact: createEmptyBoundaryImpact(),
+    confidence: 0.86,
+    applyModeHint: "auto",
+    requiredChecks: ["parse", "lint", "typecheck"],
+    dependencies: [],
+    conflicts: [],
+    provenance: {
+      detectors: ["ts-worker-unused-symbol"],
+      evidence: [`line_span:${length}`, `symbol:${symbol}`],
+    },
+  });
+}
+function hasModuleSyntax(sourceFile: ts.SourceFile): boolean {
+  return sourceFile.statements.some((statement) => {
+    if (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement) || ts.isExportAssignment(statement)) {
+      return true;
+    }
+    return ts.canHaveModifiers(statement) && !!ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+  });
+}
+
 function buildUnusedSymbolCandidates(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
   root: string,
+  projectFileCount: number,
 ): CandidatePayload[] {
   const relPath = relativePosix(root, sourceFile.fileName);
+  if (!hasModuleSyntax(sourceFile) && projectFileCount > 1) {
+    return [];
+  }
   const usageCounts = countSymbolReferences(checker, sourceFile);
   const candidates: CandidatePayload[] = [];
 
   for (const statement of sourceFile.statements) {
-    if (!ts.isFunctionDeclaration(statement) || !statement.name || statement.end === undefined) {
+    if (ts.isFunctionDeclaration(statement) && statement.name && statement.end !== undefined) {
+      if (isExportedNode(statement)) {
+        continue;
+      }
+      const symbol = checker.getSymbolAtLocation(statement.name);
+      if (!symbol || (usageCounts.get(symbol) ?? 0) > 0) {
+        continue;
+      }
+      const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+      const endLine = sourceFile.getLineAndCharacterOfPosition(statement.end).line + 1;
+      pushUnusedSymbolCandidate(candidates, {
+        relPath,
+        startLine,
+        endLine,
+        symbol: statement.name.text,
+        description: `Top-level TypeScript function \`${statement.name.text}\` in ${relPath} is not referenced`,
+      });
       continue;
     }
-    if (isExportedNode(statement)) {
+
+    if (ts.isClassDeclaration(statement) && statement.name && statement.end !== undefined) {
+      if (isExportedNode(statement)) {
+        continue;
+      }
+      const symbol = checker.getSymbolAtLocation(statement.name);
+      if (!symbol || (usageCounts.get(symbol) ?? 0) > 0) {
+        continue;
+      }
+      const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+      const endLine = sourceFile.getLineAndCharacterOfPosition(statement.end).line + 1;
+      pushUnusedSymbolCandidate(candidates, {
+        relPath,
+        startLine,
+        endLine,
+        symbol: statement.name.text,
+        description: `Top-level TypeScript class \`${statement.name.text}\` in ${relPath} is not referenced`,
+      });
       continue;
     }
-    const symbol = checker.getSymbolAtLocation(statement.name);
-    if (!symbol || (usageCounts.get(symbol) ?? 0) > 0) {
+
+    if (ts.isVariableStatement(statement) && !isExportedNode(statement) && statement.declarationList.declarations.length === 1) {
+      const declaration = statement.declarationList.declarations[0];
+      if (!ts.isIdentifier(declaration.name) || !isSideEffectFreeInitializer(declaration.initializer)) {
+        continue;
+      }
+      const symbol = checker.getSymbolAtLocation(declaration.name);
+      if (!symbol || (usageCounts.get(symbol) ?? 0) > 0) {
+        continue;
+      }
+      const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
+      const endLine = sourceFile.getLineAndCharacterOfPosition(statement.end).line + 1;
+      pushUnusedSymbolCandidate(candidates, {
+        relPath,
+        startLine,
+        endLine,
+        symbol: declaration.name.text,
+        description: `Top-level TypeScript variable \`${declaration.name.text}\` in ${relPath} is not referenced`,
+      });
       continue;
     }
-    const startLine = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile)).line + 1;
-    const endLine = sourceFile.getLineAndCharacterOfPosition(statement.end).line + 1;
-    const length = endLine - startLine + 1;
-    candidates.push({
-      id: `ts-unused-symbol-${relPath}-${startLine}-${statement.name.text}`,
-      kind: "unused_symbol",
-      title: `Remove unused symbol ${statement.name.text}`,
-      description: `Top-level TypeScript function \`${statement.name.text}\` in ${relPath} is not referenced`,
-      language: "typescript",
-      scope: "module",
-      source: ["static"],
-      files: [relPath],
-      symbols: [statement.name.text],
-      anchorRegions: [{ file: relPath, startLine, endLine }],
-      estimatedBenefit: { maintainabilityGain: 0.18 },
-      estimatedRisk: { semanticRisk: 0.08, conflictRisk: 0.04 },
-      estimatedDiff: { filesTouched: 1, linesDeleted: length, linesModified: length },
-      contextSignals: createEmptyContextSignals(),
-      boundaryImpact: createEmptyBoundaryImpact(),
-      confidence: 0.86,
-      applyModeHint: "auto",
-      requiredChecks: ["parse", "lint", "typecheck"],
-      dependencies: [],
-      conflicts: [],
-      provenance: {
-        detectors: ["ts-worker-unused-symbol"],
-        evidence: [`line_span:${length}`, `symbol:${statement.name.text}`],
-      },
-    });
+
   }
 
   return candidates;
@@ -961,11 +1218,12 @@ function scan(rootArg: string): WorkerScanSuccess {
       continue;
     }
     candidates.push(...buildUnusedImportCandidates(checker, sourceFile, root));
-    candidates.push(...buildUnusedSymbolCandidates(checker, sourceFile, root));
+    candidates.push(...buildUnusedSymbolCandidates(checker, sourceFile, root, files.length));
     candidates.push(...buildLongFunctionCandidates(sourceFile, root));
     candidates.push(...buildLargeModuleCandidates(sourceFile, root));
     candidates.push(...buildDuplicateFunctionCandidates(sourceFile, root));
     candidates.push(...buildRemoveAbstractionCandidates(sourceFile, root));
+    candidates.push(...buildInlineFunctionCandidates(checker, sourceFile, root));
   }
   candidates.push(...buildLayerViolationCandidates(root, files, program));
   candidates.push(...buildCycleCandidates(root, files, program));
@@ -1044,15 +1302,17 @@ function parseRequest(payload: string): WorkerRequest {
 async function main(): Promise<void> {
   let response: WorkerResponse;
   let shouldFail = false;
+  let command: WorkerCommand = "scan";
 
   try {
     const request = parseRequest(await readStdin());
-    response = request.command === "scan" ? scan(request.root) : verify(request.root);
+    command = request.command;
+    response = command === "scan" ? scan(request.root) : verify(request.root);
   } catch (error) {
     shouldFail = true;
     response = typeof error === "object" && error !== null && "ok" in error
       ? (error as WorkerFailure)
-      : failure("scan", "execution_failed", error instanceof Error ? error.message : String(error));
+      : failure(command, "execution_failed", error instanceof Error ? error.message : String(error));
   }
 
   process.stdout.write(`${JSON.stringify(response)}\n`);

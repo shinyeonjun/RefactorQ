@@ -3,20 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+from ..filesystem import is_ignored_path
 from .models import RepoManifestMap, RepoSnapshot
 
-IGNORED_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "dist",
-    "build",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    "coverage",
-}
 BOUNDARY_FILENAMES = {
     "openapi.yaml",
     "openapi.yml",
@@ -30,7 +19,7 @@ def _iter_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(part in IGNORED_DIRS for part in path.parts):
+        if is_ignored_path(path):
             continue
         yield path
 

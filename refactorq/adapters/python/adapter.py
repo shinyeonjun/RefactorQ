@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from typing import Literal
+from collections import Counter, defaultdict
 import ast
 from pathlib import Path
 
 from refactorq.core.candidate.models import (
     AnchorRegion,
+    BoundaryImpact,
     Candidate,
     EstimatedBenefit,
     EstimatedDiff,
@@ -21,6 +23,7 @@ TOP_LEVEL_STATEMENT_THRESHOLD = 18
 DUPLICATE_FUNCTION_MIN_LINES = 3
 _CLIENT_LAYER_TOKENS = {"frontend", "client", "web", "ui"}
 _SERVER_LAYER_TOKENS = {"backend", "server", "api", "controller", "controllers"}
+INLINE_FUNCTION_MAX_LINES = 8
 
 
 def _region(file: str, start_line: int, end_line: int) -> AnchorRegion:
@@ -37,6 +40,17 @@ def _risk(payload: dict[str, float]) -> EstimatedRisk:
 
 def _diff(payload: dict[str, int]) -> EstimatedDiff:
     return EstimatedDiff.model_validate(payload)
+
+
+def _layer_boundary_impact(producer_side: str, consumer_side: str) -> BoundaryImpact:
+    return BoundaryImpact(
+        crossLanguage=False,
+        boundaryTypes=[],
+        producerSide=[producer_side],
+        consumerSide=[consumer_side],
+        contractArtifacts=[],
+        impactLevel="medium",
+    )
 
 
 def _duplicate_function_key(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
@@ -71,6 +85,164 @@ def _passthrough_target(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | N
     if not isinstance(value.func, ast.Name) or value.func.id == node.name:
         return None
     return value.func.id
+
+
+def _is_private_unexported_name(name: str, exported_names: set[str]) -> bool:
+    return name.startswith("_") and not name.startswith("__") and name not in exported_names
+
+
+def _is_side_effect_free_python_initializer(node: ast.AST | None) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Not, ast.Invert)):
+        return _is_side_effect_free_python_initializer(node.operand)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_side_effect_free_python_initializer(element) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (key is None or _is_side_effect_free_python_initializer(key))
+            and _is_side_effect_free_python_initializer(value)
+            for key, value in zip(node.keys, node.values, strict=False)
+        )
+    return False
+
+
+def _unused_import_apply_mode(raw_lines: list[str], node: ast.Import | ast.ImportFrom, bound_name: str) -> Literal["auto", "report_only"]:
+    if node.lineno < 1 or node.lineno > len(raw_lines):
+        return "report_only"
+    if node.end_lineno != node.lineno:
+        return "report_only"
+    line = raw_lines[node.lineno - 1]
+    stripped = line.strip()
+    if not stripped or not stripped.startswith(("import ", "from ")) or "\\" in stripped:
+        return "report_only"
+    if "#" in line or "(" in line or ")" in line:
+        return "report_only"
+    if isinstance(node, ast.Import):
+        specifiers = [part.strip() for part in stripped[len("import ") :].split(",")]
+    else:
+        if " import " not in stripped:
+            return "report_only"
+        specifiers = [part.strip() for part in stripped.split(" import ", 1)[1].split(",")]
+    return "auto" if any((" as " in specifier and specifier.rsplit(" as ", 1)[1].strip() == bound_name) or specifier.split(".", 1)[0].strip() == bound_name for specifier in specifiers) else "report_only"
+
+
+def _top_level_unused_assignment_candidate(
+    rel_path: str,
+    node: ast.Assign | ast.AnnAssign,
+    referenced_names: set[str],
+    exported_names: set[str],
+) -> Candidate | None:
+    if node.end_lineno is None:
+        return None
+    target: ast.expr
+    value: ast.expr | None
+    if isinstance(node, ast.Assign):
+        if len(node.targets) != 1:
+            return None
+        target = node.targets[0]
+        value = node.value
+    else:
+        if not node.simple:
+            return None
+        target = node.target
+        value = node.value
+    if value is None:
+        return None
+    if not isinstance(target, ast.Name):
+        return None
+    if not _is_private_unexported_name(target.id, exported_names):
+        return None
+    if target.id in referenced_names:
+        return None
+    if not _is_side_effect_free_python_initializer(value):
+        return None
+    length = node.end_lineno - node.lineno + 1
+    return Candidate(
+        id=f"py-unused-symbol-{rel_path}-{node.lineno}-{target.id}",
+        kind="unused_symbol",
+        title=f"Remove unused private assignment {target.id}",
+        description=f"Top-level private assignment `{target.id}` in {rel_path} is not referenced",
+        language="python",
+        scope="module",
+        source=["static"],
+        files=[rel_path],
+        symbols=[target.id],
+        anchorRegions=[_region(rel_path, node.lineno, node.end_lineno)],
+        estimatedBenefit=_benefit({"maintainabilityGain": 0.12}),
+        estimatedRisk=_risk({"semanticRisk": 0.03, "conflictRisk": 0.03}),
+        estimatedDiff=_diff(
+            {
+                "filesTouched": 1,
+                "linesDeleted": length,
+                "linesModified": length,
+            }
+        ),
+        confidence=0.9,
+        applyModeHint="auto",
+        requiredChecks=["parse", "lint", "typecheck"],
+        provenance=Provenance(
+            detectors=["python-ast-unused-symbol"],
+            evidence=[f"line_span:{length}", f"symbol:{target.id}"],
+        ),
+    )
+
+
+def _build_inline_function_candidates(
+    rel_path: str,
+    inline_functions: list[tuple[str, int, int, int]],
+) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    for name, start_line, end_line, reference_count in inline_functions:
+        length = end_line - start_line + 1
+        candidates.append(
+            Candidate(
+                id=f"py-inline-function-{rel_path}-{start_line}-{name}",
+                kind="inline_function",
+                title=f"Inline single-use helper {name}",
+                description=(
+                    f"Private helper `{name}` in {rel_path} is referenced only once and is a candidate for"
+                    " inlining into its caller"
+                ),
+                language="python",
+                scope="module",
+                source=["static", "metric"],
+                files=[rel_path],
+                symbols=[name],
+                anchorRegions=[_region(rel_path, start_line, end_line)],
+                estimatedBenefit=_benefit(
+                    {
+                        "complexityReduction": min(1.0, length / max(INLINE_FUNCTION_MAX_LINES, 1)),
+                        "maintainabilityGain": 0.24,
+                    }
+                ),
+                estimatedRisk=_risk(
+                    {
+                        "semanticRisk": 0.24,
+                        "apiRisk": 0.06,
+                        "testRisk": 0.18,
+                        "conflictRisk": 0.1,
+                    }
+                ),
+                estimatedDiff=_diff(
+                    {
+                        "filesTouched": 1,
+                        "linesAdded": max(1, length // 2),
+                        "linesModified": length,
+                    }
+                ),
+                confidence=0.72,
+                applyModeHint="guarded",
+                requiredChecks=["parse", "lint", "typecheck", "unit_test"],
+                provenance=Provenance(
+                    detectors=["python-ast-single-use-helper"],
+                    evidence=[f"symbol:{name}", f"referenceCount:{reference_count}", f"line_span:{length}"],
+                ),
+            )
+        )
+    return candidates
 
 
 def _build_duplicate_candidates(
@@ -211,12 +383,16 @@ def _exported_names(tree: ast.AST) -> set[str]:
 
 
 
+def _loaded_name_counts(tree: ast.AST) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            counts[node.id] += 1
+    return counts
+
+
 def _referenced_names(tree: ast.AST) -> set[str]:
-    return {
-        node.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-    }
+    return set(_loaded_name_counts(tree))
 
 
 
@@ -400,7 +576,9 @@ class PythonAdapter:
 
         rel_path = path.relative_to(root).as_posix()
         lines = source.splitlines()
-        referenced_names = _referenced_names(tree)
+        raw_lines = source.splitlines(keepends=True)
+        loaded_name_counts = _loaded_name_counts(tree)
+        referenced_names = set(loaded_name_counts)
         exported_names = _exported_names(tree)
         current_module = _module_name(root, path)
         is_package = path.name == "__init__.py"
@@ -410,6 +588,7 @@ class PythonAdapter:
         seen_layer_violations: set[tuple[int, str, tuple[str, ...]]] = set()
         duplicate_functions: list[tuple[str, int, int, str]] = []
         passthrough_functions: list[tuple[str, int, int, str]] = []
+        inline_functions: list[tuple[str, int, int, int]] = []
         top_level_statements = len(tree.body)
         if len(lines) >= LARGE_MODULE_THRESHOLD or top_level_statements >= TOP_LEVEL_STATEMENT_THRESHOLD:
             candidates.append(
@@ -466,6 +645,7 @@ class PythonAdapter:
                         continue
                     if bound_name in referenced_names:
                         continue
+                    apply_mode_hint = _unused_import_apply_mode(raw_lines, node, bound_name)
                     candidates.append(
                         Candidate(
                             id=f"py-unused-import-{rel_path}-{node.lineno}-{bound_name}",
@@ -484,7 +664,7 @@ class PythonAdapter:
                                 {"filesTouched": 1, "linesDeleted": 1, "linesModified": 1}
                             ),
                             confidence=0.95,
-                            applyModeHint="auto",
+                            applyModeHint=apply_mode_hint,
                             requiredChecks=["parse", "lint", "typecheck"],
                             provenance=Provenance(
                                 detectors=["python-ast-unused-import"],
@@ -516,6 +696,16 @@ class PythonAdapter:
                 passthrough_target = _passthrough_target(node)
                 if passthrough_target and node.name.startswith("_") and not node.name.startswith("__") and node.name not in exported_names:
                     passthrough_functions.append((node.name, node.lineno, node.end_lineno, passthrough_target))
+                if (
+                    loaded_name_counts.get(node.name, 0) == 1
+                    and node.name.startswith("_")
+                    and not node.name.startswith("__")
+                    and node.name not in exported_names
+                    and passthrough_target is None
+                    and not node.decorator_list
+                    and length <= INLINE_FUNCTION_MAX_LINES
+                ):
+                    inline_functions.append((node.name, node.lineno, node.end_lineno, 1))
                 if length < LONG_FUNCTION_THRESHOLD:
                     continue
                 candidates.append(
@@ -564,6 +754,12 @@ class PythonAdapter:
                 )
 
         for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            candidate = _top_level_unused_assignment_candidate(rel_path, node, referenced_names, exported_names)
+            if candidate is not None:
+                candidates.append(candidate)
+        for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.end_lineno is None:
                 continue
             if not node.name.startswith("_") or node.name.startswith("__"):
@@ -601,9 +797,48 @@ class PythonAdapter:
                     ),
                 )
             )
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or node.end_lineno is None:
+                continue
+            if not node.name.startswith("_") or node.name.startswith("__"):
+                continue
+            if node.name in referenced_names or node.name in exported_names:
+                continue
+            length = node.end_lineno - node.lineno + 1
+            candidates.append(
+                Candidate(
+                    id=f"py-dead-code-{rel_path}-{node.lineno}-{node.name}",
+                    kind="dead_code",
+                    title=f"Remove unused private class {node.name}",
+                    description=f"Top-level private class `{node.name}` in {rel_path} is not referenced",
+                    language="python",
+                    scope="module",
+                    source=["static"],
+                    files=[rel_path],
+                    symbols=[node.name],
+                    anchorRegions=[_region(rel_path, node.lineno, node.end_lineno)],
+                    estimatedBenefit=_benefit({"maintainabilityGain": 0.18}),
+                    estimatedRisk=_risk({"semanticRisk": 0.1, "conflictRisk": 0.05}),
+                    estimatedDiff=_diff(
+                        {
+                            "filesTouched": 1,
+                            "linesDeleted": length,
+                            "linesModified": length,
+                        }
+                    ),
+                    confidence=0.84,
+                    applyModeHint="auto",
+                    requiredChecks=["parse", "lint", "typecheck"],
+                    provenance=Provenance(
+                        detectors=["python-ast-dead-code"],
+                        evidence=[f"line_span:{length}", f"symbol:{node.name}"],
+                    ),
+                )
+            )
 
         candidates.extend(_build_duplicate_candidates(rel_path, duplicate_functions))
         candidates.extend(_build_remove_abstraction_candidates(rel_path, passthrough_functions))
+        candidates.extend(_build_inline_function_candidates(rel_path, inline_functions))
         for line_number, target_rel_path, imported_symbols in sorted(layer_violations):
             candidates.append(
                 Candidate(
@@ -623,6 +858,7 @@ class PythonAdapter:
                     estimatedBenefit=_benefit({"maintainabilityGain": 0.32}),
                     estimatedRisk=_risk({"semanticRisk": 0.22, "apiRisk": 0.1, "testRisk": 0.18, "conflictRisk": 0.12}),
                     estimatedDiff=_diff({"filesTouched": 2, "linesAdded": 4, "linesModified": 8}),
+                    boundaryImpact=_layer_boundary_impact(target_rel_path, rel_path),
                     confidence=0.69,
                     applyModeHint="report_only",
                     requiredChecks=["parse", "lint", "typecheck", "unit_test"],
@@ -652,6 +888,7 @@ class PythonAdapter:
                         estimatedBenefit=_benefit({"maintainabilityGain": 0.28}),
                         estimatedRisk=_risk({"semanticRisk": 0.28, "apiRisk": 0.16, "testRisk": 0.22, "conflictRisk": 0.14}),
                         estimatedDiff=_diff({"filesTouched": 2, "linesAdded": 6, "linesModified": 10}),
+                        boundaryImpact=_layer_boundary_impact(target_rel_path, rel_path),
                         confidence=0.64,
                         applyModeHint="report_only",
                         requiredChecks=["parse", "lint", "typecheck", "unit_test"],

@@ -5,6 +5,7 @@ from typing import Iterable
 
 IGNORED_DIRS = {
     ".git",
+    ".gjc",
     ".venv",
     "venv",
     "node_modules",
@@ -17,11 +18,15 @@ IGNORED_DIRS = {
 }
 
 
+def is_ignored_path(path: Path) -> bool:
+    return any(part in IGNORED_DIRS for part in path.parts)
+
+
 def walk_repo_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(part in IGNORED_DIRS for part in path.parts):
+        if is_ignored_path(path):
             continue
         yield path
 

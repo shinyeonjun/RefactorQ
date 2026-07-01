@@ -21,6 +21,11 @@ import refactorq.core.service as service_module
 runner = CliRunner()
 
 
+def _openapi_contract() -> str:
+    return "openapi: 3.1.0\npaths:\n  /items:\n    get:\n      operationId: listItems\n"
+
+
+
 def _repo_snapshot(root: Path) -> RepoSnapshot:
     return RepoSnapshot(
         root=str(root.resolve()),
@@ -287,9 +292,9 @@ def test_service_scan_enriches_boundary_candidates_for_mixed_repo(tmp_path: Path
     frontend = tmp_path / "frontend"
     backend.mkdir()
     frontend.mkdir()
-    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\n", encoding="utf-8")
-    (backend / "api.py").write_text("import os\n\nprint('ok')\n", encoding="utf-8")
-    (frontend / "client.ts").write_text("function helper() {\n  return 1;\n}\n\nconsole.log('ok');\n", encoding="utf-8")
+    (tmp_path / "openapi.yaml").write_text(_openapi_contract(), encoding="utf-8")
+    (backend / "api.py").write_text('import os\n\nROUTE = "/items"\nprint(ROUTE)\n', encoding="utf-8")
+    (frontend / "client.ts").write_text('const endpoint = "/items";\nconsole.log(endpoint);\n', encoding="utf-8")
 
     result = RefactorQService().scan(tmp_path)
 
@@ -306,3 +311,21 @@ def test_service_scan_enriches_boundary_candidates_for_mixed_repo(tmp_path: Path
     assert "http_api" in enriched_python.boundary_impact.boundary_types
     assert "openapi.yaml" in enriched_python.boundary_impact.contract_artifacts
     assert "backend/api.py" in enriched_python.boundary_impact.producer_side
+    assert "integration_test" in enriched_python.required_checks
+    assert "build" in enriched_python.required_checks
+
+
+def test_service_scan_links_only_matching_boundary_contract_artifacts(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "openapi.yaml").write_text(_openapi_contract(), encoding="utf-8")
+    (tmp_path / "schema.json").write_text('{"title":"Example"}\n', encoding="utf-8")
+    (backend / "api.py").write_text('import os\n\nROUTE = "/items"\nprint(ROUTE)\n', encoding="utf-8")
+    (frontend / "client.ts").write_text('const endpoint = "/items";\nconsole.log(endpoint);\n', encoding="utf-8")
+
+    result = RefactorQService().scan(tmp_path)
+
+    enriched_python = next(candidate for candidate in result.candidates if candidate.id.startswith("py-unused-import-backend/api.py"))
+    assert enriched_python.boundary_impact.contract_artifacts == ["openapi.yaml"]

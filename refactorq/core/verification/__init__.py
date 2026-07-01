@@ -1,3 +1,12 @@
-from .models import VerificationCheckResult, VerificationKind, VerificationResult, VerificationStatus
+from .models import ProofRecord, ProofStatus, VerificationCheckResult, VerificationKind, VerificationReadiness, VerificationReport, VerificationResult, VerificationStatus
 
-__all__ = ["VerificationCheckResult", "VerificationKind", "VerificationResult", "VerificationStatus"]
+__all__ = [
+    "ProofRecord",
+    "ProofStatus",
+    "VerificationCheckResult",
+    "VerificationKind",
+    "VerificationReadiness",
+    "VerificationReport",
+    "VerificationResult",
+    "VerificationStatus",
+]

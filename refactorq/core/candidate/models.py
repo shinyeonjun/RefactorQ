@@ -34,6 +34,17 @@ VerificationCheck = Literal[
     "benchmark",
     "coverage_check",
 ]
+RequestedProofKind = Literal[
+    "parse",
+    "lint",
+    "typecheck",
+    "build",
+    "unit_test",
+    "integration_test",
+    "boundary_contract",
+    "boundary_integration",
+    "manual_review",
+]
 BoundaryType = Literal[
     "http_api",
     "graphql",
@@ -123,6 +134,8 @@ class Candidate(BaseModel):
     confidence: float = 0.0
     apply_mode_hint: ApplyMode = Field(default="report_only", alias="applyModeHint")
     required_checks: list[VerificationCheck] = Field(default_factory=list, alias="requiredChecks")
+    proof_ids: list[str] = Field(default_factory=list, alias="proofIds")
+    requested_proof_kinds: list[RequestedProofKind] = Field(default_factory=list, alias="requestedProofKinds")
     dependencies: list[str] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
     provenance: Provenance = Field(default_factory=Provenance)

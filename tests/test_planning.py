@@ -101,7 +101,13 @@ def test_safe_mode_filters_to_low_risk_auto_candidates() -> None:
     result = build_plan(mode="safe", repo=_repo_snapshot(), adapter_names=["python"], candidates=candidates)
 
     assert [candidate.id for candidate in result.selected_candidates] == ["safe-auto"]
-    assert result.excluded_candidates == []
+    excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
+    assert excluded == {
+        "guarded": "requires guarded or report-only handling",
+        "boundary-high": "boundary-changing candidates are excluded in safe mode",
+        "cross-language": "cross-language boundary candidates are excluded in safe mode",
+        "missing-checks": "candidate is missing required checks",
+    }
     assert result.required_checks == ["parse", "lint"]
 
 
@@ -201,6 +207,37 @@ def test_report_mode_preserves_deterministic_ranking_order() -> None:
     ]
 
 
+
+def test_report_mode_prioritizes_candidate_value_over_apply_mode() -> None:
+    high_value_report = Candidate.model_validate(
+        {
+            **_candidate(
+                "high-value-report",
+                apply_mode_hint="report_only",
+                maintainability_gain=0.6,
+                files=["src/report.py"],
+            ).model_dump(by_alias=True),
+            "kind": "split_large_module",
+            "anchorRegions": [],
+            "estimatedBenefit": {
+                "complexityReduction": 1.0,
+                "duplicationReduction": 1.0,
+                "maintainabilityGain": 0.6,
+            },
+        }
+    )
+    low_value_auto = _candidate("low-value-auto", maintainability_gain=0.05, files=["src/auto.py"])
+
+    result = build_plan(
+        mode="report",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[low_value_auto, high_value_report],
+    )
+
+    assert [candidate.id for candidate in result.selected_candidates] == ["high-value-report", "low-value-auto"]
+
+
 def test_safe_mode_enforces_batch_candidate_budget() -> None:
     candidates = [_candidate(f"auto-{index}", files=[f"src/{index}.py"]) for index in range(14)]
 
@@ -234,6 +271,74 @@ def test_balanced_mode_enforces_guarded_budget_and_overlap_budget() -> None:
     assert len(result.selected_candidates) == 8
     excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
     assert excluded["guarded-8"] == "balanced guarded candidate budget reached"
+
+
+def test_balanced_mode_excludes_same_symbol_scope_conflicts_from_selected_batch() -> None:
+    keep = _candidate(
+        "keep-shared-symbol",
+        files=["src/shared.py"],
+        symbols=["shared_helper"],
+        scope="module",
+        confidence=0.95,
+        maintainability_gain=0.35,
+    )
+    conflict = _candidate(
+        "conflict-shared-symbol",
+        files=["src/other.py"],
+        symbols=["shared_helper"],
+        scope="module",
+        confidence=0.6,
+        maintainability_gain=0.1,
+    )
+
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[conflict, keep],
+    )
+
+    assert [candidate.id for candidate in result.selected_candidates] == ["keep-shared-symbol"]
+    excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
+    assert (
+        excluded["conflict-shared-symbol"]
+        == "candidate shares the same symbol and scope as already selected batch candidate keep-shared-symbol"
+    )
+
+
+def test_balanced_mode_excludes_same_file_non_local_conflicts_from_selected_batch() -> None:
+    keep = _candidate(
+        "keep-module-file",
+        files=["src/shared.py"],
+        symbols=["module_helper"],
+        scope="module",
+        confidence=0.95,
+        maintainability_gain=0.35,
+    )
+    conflict = _candidate(
+        "conflict-module-file",
+        files=["src/shared.py"],
+        symbols=["other_helper"],
+        scope="module",
+        start_line=20,
+        end_line=25,
+        confidence=0.6,
+        maintainability_gain=0.1,
+    )
+
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[conflict, keep],
+    )
+
+    assert [candidate.id for candidate in result.selected_candidates] == ["keep-module-file"]
+    excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
+    assert (
+        excluded["conflict-module-file"]
+        == "candidate touches the same file as non-local already selected batch candidate keep-module-file"
+    )
 
 
 def test_report_mode_prefers_higher_cycle_reduction_when_risk_matches() -> None:
@@ -404,6 +509,152 @@ def test_plan_adds_duplicate_extract_and_cycle_split_dependencies() -> None:
     ) in dependency_edges
 
 
+def test_plan_adds_boundary_review_and_move_symbol_dependencies() -> None:
+    boundary_review = Candidate.model_validate(
+        {
+            **_candidate(
+                "boundary-review-openapi-yaml",
+                files=["openapi.yaml"],
+                scope="architecture",
+                apply_mode_hint="report_only",
+                language="mixed",
+            ).model_dump(by_alias=True),
+            "kind": "custom",
+            "boundaryImpact": {
+                "crossLanguage": True,
+                "boundaryTypes": ["openapi", "http_api"],
+                "contractArtifacts": ["openapi.yaml"],
+                "impactLevel": "high",
+            },
+        }
+    )
+    layer_violation = Candidate.model_validate(
+        {
+            **_candidate(
+                "layer-violation",
+                files=["frontend/ui.ts", "backend/service.ts"],
+                symbols=["service"],
+                scope="package",
+                apply_mode_hint="report_only",
+                language="typescript",
+            ).model_dump(by_alias=True),
+            "kind": "layer_violation_fix",
+        }
+    )
+    move_symbol = Candidate.model_validate(
+        {
+            **_candidate(
+                "move-symbol",
+                files=["frontend/ui.ts", "backend/service.ts"],
+                symbols=["service"],
+                scope="package",
+                apply_mode_hint="report_only",
+                language="typescript",
+            ).model_dump(by_alias=True),
+            "kind": "move_symbol",
+            "boundaryImpact": {
+                "crossLanguage": True,
+                "boundaryTypes": ["openapi", "http_api"],
+                "producerSide": ["backend/service.ts"],
+                "consumerSide": ["frontend/ui.ts"],
+                "contractArtifacts": ["openapi.yaml"],
+                "impactLevel": "high",
+            },
+        }
+    )
+
+    result = build_plan(
+        mode="report",
+        repo=_repo_snapshot(),
+        adapter_names=["typescript"],
+        candidates=[boundary_review, layer_violation, move_symbol],
+    )
+
+    dependency_edges = {
+        (edge.from_id, edge.to_id, edge.reason)
+        for edge in result.edges
+        if edge.kind == "dependency"
+    }
+    assert (
+        "move-symbol",
+        "layer-violation",
+        "review layer violation before moving the shared boundary symbol",
+    ) in dependency_edges
+    assert (
+        "move-symbol",
+        "boundary-review-openapi-yaml",
+        "review boundary contract artifact before cross-language execution",
+    ) in dependency_edges
+
+
+def test_balanced_mode_preserves_edges_for_excluded_boundary_review_candidates() -> None:
+    boundary_review = Candidate.model_validate(
+        {
+            **_candidate(
+                "boundary-review-openapi-yaml",
+                files=["openapi.yaml"],
+                scope="architecture",
+                apply_mode_hint="report_only",
+                language="mixed",
+            ).model_dump(by_alias=True),
+            "kind": "custom",
+            "boundaryImpact": {
+                "crossLanguage": True,
+                "boundaryTypes": ["openapi", "http_api"],
+                "contractArtifacts": ["openapi.yaml"],
+                "impactLevel": "high",
+            },
+        }
+    )
+    cross_language = Candidate.model_validate(
+        {
+            **_candidate(
+                "cross-language-low",
+                cross_language=True,
+                impact_level="low",
+                files=["backend/api.py"],
+                contract_artifacts=["openapi.yaml"],
+            ).model_dump(by_alias=True),
+            "kind": "extract_function",
+            "applyModeHint": "guarded",
+            "scope": "module",
+            "symbols": ["very_long_function"],
+        }
+    )
+
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[cross_language, boundary_review],
+    )
+
+    dependency_edges = {
+        (edge.from_id, edge.to_id, edge.reason)
+        for edge in result.edges
+        if edge.kind == "dependency"
+    }
+    assert (
+        "cross-language-low",
+        "boundary-review-openapi-yaml",
+        "review boundary contract artifact before cross-language execution",
+    ) in dependency_edges
+
+
+def test_balanced_mode_prefers_lower_verification_burden_when_scores_match() -> None:
+    lighter = _candidate("lighter", files=["src/a.py"], required_checks=["parse", "lint"])
+    heavier = _candidate("heavier", files=["src/b.py"], required_checks=["parse", "lint", "typecheck", "unit_test"])
+
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[heavier, lighter],
+    )
+
+    assert [candidate.id for candidate in result.selected_candidates] == ["lighter", "heavier"]
+
+
 def test_plan_adds_synergy_edges_for_related_structural_candidates() -> None:
     duplicate = Candidate.model_validate(
         {
@@ -473,12 +724,40 @@ def test_plan_adds_synergy_edges_for_related_structural_candidates() -> None:
             "anchorRegions": [],
         }
     )
+    layer_fix = Candidate.model_validate(
+        {
+            **_candidate(
+                "layer-fix",
+                files=["src/frontend/ui.py", "src/backend/service.py"],
+                symbols=["service"],
+                scope="architecture",
+                apply_mode_hint="report_only",
+                impact_level="high",
+            ).model_dump(by_alias=True),
+            "kind": "layer_violation_fix",
+            "anchorRegions": [{"file": "src/frontend/ui.py", "startLine": 4, "endLine": 4}],
+        }
+    )
+    move_symbol = Candidate.model_validate(
+        {
+            **_candidate(
+                "move-symbol",
+                files=["src/frontend/ui.py", "src/backend/service.py"],
+                symbols=["service"],
+                scope="architecture",
+                apply_mode_hint="report_only",
+                impact_level="high",
+            ).model_dump(by_alias=True),
+            "kind": "move_symbol",
+            "anchorRegions": [{"file": "src/frontend/ui.py", "startLine": 4, "endLine": 4}],
+        }
+    )
 
     result = build_plan(
         mode="report",
         repo=_repo_snapshot(),
         adapter_names=["python"],
-        candidates=[duplicate, extract, remove, split, cycle],
+        candidates=[duplicate, extract, remove, split, cycle, layer_fix, move_symbol],
     )
 
     synergy_edges = {
@@ -497,6 +776,10 @@ def test_plan_adds_synergy_edges_for_related_structural_candidates() -> None:
     assert (
         frozenset(("split-shared", "cycle-shared")),
         "cycle reduction and module splitting reinforce the same structural cleanup",
+    ) in synergy_edges
+    assert (
+        frozenset(("layer-fix", "move-symbol")),
+        "layer boundary review and symbol relocation target the same cross-layer import",
     ) in synergy_edges
 
 

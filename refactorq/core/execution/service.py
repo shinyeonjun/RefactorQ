@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import subprocess
@@ -7,8 +8,10 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from refactorq.agents.codex import CodexGuardedApplier
+from refactorq.agents.codex import SUPPORTED_GUARDED_KINDS, CodexGuardedApplier, GuardedExecutionContractError
 from refactorq.core.candidate import Candidate
+from refactorq.core.candidate.models import VerificationCheck
+
 from refactorq.core.filesystem import walk_repo_files
 from refactorq.core.git_execution import (
     GitExecutionContext,
@@ -18,24 +21,27 @@ from refactorq.core.git_execution import (
     abort_git_execution,
 )
 from refactorq.core.planning import PlanResult
-from refactorq.core.verification import VerificationResult
-from refactorq.core.verification.service import verify_repo
+from refactorq.core.verification import VerificationReadiness, VerificationResult
+from refactorq.core.verification.service import build_verification_report, verify_repo
 
 from .models import (
     ApplyResult,
+    BoundaryExecutionSummary,
     ExecutionCandidateNote,
     ExecutionSupportSummary,
-    BoundaryExecutionSummary,
     GitExecutionResult,
     RepairResult,
     ReportResult,
     RunResult,
+    VerificationPlanSummary,
 )
 
 _IMPORT_PREFIXES = ("import ", "from ")
 _TS_IMPORT_PATTERN = re.compile(
     r'^(?P<indent>\s*)import\s+(?P<clause>.+?)\s+from\s+(?P<source>["\'][^"\']+["\'];?\s*)$'
 )
+
+_CROSS_LANGUAGE_GUARDED_KINDS = set(SUPPORTED_GUARDED_KINDS)
 
 
 class _ApplyInternalResult(ApplyResult):
@@ -116,6 +122,11 @@ def _rewrite_typescript_import(line: str, symbol: str) -> str | None:
     source = match.group("source")
     newline = "\n" if line.endswith("\n") else ""
 
+    type_prefix = ""
+    if clause.startswith("type "):
+        type_prefix = "type "
+        clause = clause[len("type ") :].strip()
+
     if clause.startswith("* as "):
         return "" if clause[len("* as ") :].strip() == symbol else None
 
@@ -148,15 +159,16 @@ def _rewrite_typescript_import(line: str, symbol: str) -> str | None:
         return None
     if default_part is None and named_part is None:
         return ""
+    import_prefix = f"{indent}import {type_prefix}"
     if default_part is not None and named_part is None:
-        return f"{indent}import {default_part} from {source}{newline}"
+        return f"{import_prefix}{default_part} from {source}{newline}"
     if default_part is None and not named_specifiers:
         return ""
     if default_part is None:
-        return f"{indent}import {{ {', '.join(named_specifiers)} }} from {source}{newline}"
+        return f"{import_prefix}{{ {', '.join(named_specifiers)} }} from {source}{newline}"
     if not named_specifiers:
-        return f"{indent}import {default_part} from {source}{newline}"
-    return f"{indent}import {default_part}, {{ {', '.join(named_specifiers)} }} from {source}{newline}"
+        return f"{import_prefix}{default_part} from {source}{newline}"
+    return f"{import_prefix}{default_part}, {{ {', '.join(named_specifiers)} }} from {source}{newline}"
 
 
 def _rewrite_unused_import_line(candidate: Candidate, line: str) -> str | None:
@@ -190,11 +202,58 @@ def _auto_support_reason(root: Path, candidate: Candidate) -> str | None:
         if _rewrite_unused_import_line(candidate, line) is None:
             return "candidate import statement cannot be rewritten deterministically"
         return None
-    if candidate.language == "python" and candidate.kind == "dead_code":
+    if candidate.language == "python" and candidate.kind in {"dead_code", "unused_symbol"}:
         return None
     if candidate.language in {"typescript", "javascript"} and candidate.kind == "unused_symbol":
         return None
     return "candidate kind is not supported for this language"
+
+
+def _boundary_support_reason(candidate: Candidate) -> str | None:
+    if not candidate.boundary_impact.cross_language:
+        return None
+    if not candidate.boundary_impact.contract_artifacts:
+        return "cross-language candidate requires explicit boundary contract artifacts"
+    if candidate.boundary_impact.impact_level not in {"none", "low"}:
+        return "cross-language candidate requires low boundary impact for deterministic execution"
+    if (
+        candidate.apply_mode_hint == "guarded"
+        and (
+            candidate.kind not in _CROSS_LANGUAGE_GUARDED_KINDS
+            or len(candidate.files) != 1
+            or candidate.scope not in {"local", "module"}
+        )
+    ):
+        return "guarded cross-language candidate is not yet supported for boundary-aware execution"
+    return None
+
+
+def _candidate_support_reason(root: Path, candidate: Candidate, guarded_applier: CodexGuardedApplier) -> str | None:
+    boundary_reason = _boundary_support_reason(candidate)
+    if boundary_reason is not None:
+        return boundary_reason
+    if candidate.apply_mode_hint == "auto":
+        return _auto_support_reason(root, candidate)
+    if candidate.apply_mode_hint == "guarded":
+        return guarded_applier.support_reason(root, candidate)
+    return "report-only candidate is not applied"
+
+
+def _verify_for_execution(root: Path, plan: PlanResult, candidates: list[Candidate]) -> VerificationResult:
+    boundary_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none"
+    ]
+    if not boundary_candidates:
+        return verify_repo(root)
+
+    required_checks: list[VerificationCheck] = []
+    for candidate in boundary_candidates:
+        for check in candidate.required_checks:
+            if check in {"build", "integration_test"} and check not in required_checks:
+                required_checks.append(check)
+    return verify_repo(root, required_checks=required_checks, candidates=boundary_candidates)
 
 
 def _delete_region(lines: list[str], start_line: int, end_line: int) -> list[str]:
@@ -232,6 +291,56 @@ def _changed_paths(before: dict[str, bytes], after: dict[str, bytes]) -> list[st
     return [rel_path for rel_path in sorted(set(before) | set(after)) if before.get(rel_path) != after.get(rel_path)]
 
 
+def _line_count(content: bytes | None) -> int:
+    if not content:
+        return 0
+    return len(content.splitlines())
+
+
+def _changed_line_count(before: bytes | None, after: bytes | None) -> int:
+    matcher = difflib.SequenceMatcher(a=(before or b"").splitlines(), b=(after or b"").splitlines())
+    changed_lines = 0
+    for tag, before_start, before_end, after_start, after_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed_lines += max(before_end - before_start, after_end - after_start)
+    return changed_lines
+
+
+def _guarded_expected_line_budget(candidate: Candidate) -> int:
+    anchor_lines = sum(max(region.end_line - region.start_line + 1, 0) for region in candidate.anchor_regions)
+    estimated_lines = (
+        candidate.estimated_diff.lines_added
+        + candidate.estimated_diff.lines_deleted
+        + candidate.estimated_diff.lines_modified
+    )
+    return max(anchor_lines, estimated_lines, 1)
+
+
+def _guarded_same_file_diff_reason(
+    before: dict[str, bytes],
+    after: dict[str, bytes],
+    candidates: list[Candidate],
+    operation: str,
+) -> str | None:
+    candidates_by_file: dict[str, list[Candidate]] = {}
+    for candidate in candidates:
+        for rel_path in candidate.files:
+            candidates_by_file.setdefault(rel_path, []).append(candidate)
+    for rel_path, file_candidates in candidates_by_file.items():
+        if before.get(rel_path) == after.get(rel_path):
+            continue
+        total_lines = max(_line_count(before.get(rel_path)), _line_count(after.get(rel_path)))
+        if total_lines < 20:
+            continue
+        changed_lines = _changed_line_count(before.get(rel_path), after.get(rel_path))
+        expected_lines = sum(_guarded_expected_line_budget(candidate) for candidate in file_candidates)
+        allowed_changed_lines = max(24, expected_lines * 3)
+        if changed_lines > allowed_changed_lines and changed_lines * 5 >= total_lines * 4:
+            return f"{operation} exceeded the same-file diff safety budget before verification ({rel_path})"
+    return None
+
+
 def _restore_snapshot(root: Path, snapshot: dict[str, bytes]) -> bool:
     current = _snapshot_repo(root)
     restored = False
@@ -253,6 +362,8 @@ def _restore_snapshot(root: Path, snapshot: dict[str, bytes]) -> bool:
 
 
 def _guarded_failure_reason(error: Exception) -> str:
+    if isinstance(error, GuardedExecutionContractError):
+        return str(error)
     if isinstance(error, subprocess.TimeoutExpired):
         return "Codex guarded execution timed out"
     if isinstance(error, subprocess.CalledProcessError):
@@ -284,24 +395,46 @@ def _apply_guarded_candidate(root: Path, candidate: Candidate, guarded_applier: 
     after = _snapshot_repo(root)
     changed_paths = _changed_paths(before, after)
     allowed_files = set(candidate.files)
+    allowed_candidate_ids = {candidate.id}
     touched_files = set(result.touched_files)
+    declared_candidate_ids = set(result.candidate_ids)
 
     if result.status == "unsupported":
         _restore_snapshot(root, before)
         reason = result.summary[0] if result.summary else "guarded Codex flow reported unsupported"
         return False, reason
-    if result.status == "no_change" and not changed_paths:
-        reason = result.summary[0] if result.summary else "guarded Codex flow reported no changes"
-        return False, reason
+    if not declared_candidate_ids:
+        _restore_snapshot(root, before)
+        return False, "guarded Codex response omitted candidateIds for the selected candidate scope"
+    if any(candidate_id not in allowed_candidate_ids for candidate_id in declared_candidate_ids):
+        _restore_snapshot(root, before)
+        return False, "guarded Codex response declared candidateIds outside the selected candidate scope"
+
     if any(path not in allowed_files for path in changed_paths):
         _restore_snapshot(root, before)
         return False, "guarded Codex flow touched files outside the allowed candidate scope"
     if any(path not in allowed_files for path in touched_files):
         _restore_snapshot(root, before)
         return False, "guarded Codex response declared files outside the allowed candidate scope"
+    if result.status == "no_change":
+        if changed_paths:
+            _restore_snapshot(root, before)
+            return False, "guarded Codex response reported no_change despite modifying the repo"
+        if touched_files:
+            return False, "guarded Codex response touchedFiles did not match the actual changed files"
+        reason = result.summary[0] if result.summary else "guarded Codex flow reported no changes"
+        return False, reason
+    if touched_files != set(changed_paths):
+        _restore_snapshot(root, before)
+        return False, "guarded Codex response touchedFiles did not match the actual changed files"
     if not changed_paths:
         return False, "guarded Codex flow produced no file changes"
+    diff_reason = _guarded_same_file_diff_reason(before, after, [candidate], "guarded Codex flow")
+    if diff_reason is not None:
+        _restore_snapshot(root, before)
+        return False, diff_reason
     return True, None
+
 
 
 def _repair_guarded_changes(
@@ -320,6 +453,7 @@ def _repair_guarded_changes(
 
     before = _snapshot_repo(root)
     allowed_files = {file for candidate in guarded_candidates for file in candidate.files}
+    allowed_candidate_ids = {candidate.id for candidate in guarded_candidates}
     try:
         result = guarded_applier.repair(root, guarded_candidates, verification)
     except Exception as exc:  # pragma: no cover
@@ -332,6 +466,7 @@ def _repair_guarded_changes(
     after = _snapshot_repo(root)
     changed_paths = _changed_paths(before, after)
     touched_files = set(result.touched_files)
+    declared_candidate_ids = set(result.candidate_ids)
 
     if result.status == "unsupported":
         _restore_snapshot(root, before)
@@ -341,6 +476,28 @@ def _repair_guarded_changes(
                 attempted=True,
                 touchedFiles=[],
                 reason=result.summary[0] if result.summary else "guarded repair is unsupported",
+            ),
+            repaired=False,
+        )
+    if not declared_candidate_ids:
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(
+                status="failed",
+                attempted=True,
+                touchedFiles=sorted(touched_files),
+                reason="guarded Codex repair omitted candidateIds for the selected candidate scope",
+            ),
+            repaired=False,
+        )
+    if declared_candidate_ids != allowed_candidate_ids:
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(
+                status="failed",
+                attempted=True,
+                touchedFiles=sorted(touched_files),
+                reason="guarded Codex repair candidateIds did not match the selected candidate scope",
             ),
             repaired=False,
         )
@@ -366,7 +523,28 @@ def _repair_guarded_changes(
             ),
             repaired=False,
         )
-    if result.status == "no_change" and not changed_paths:
+    if result.status == "no_change":
+        if changed_paths:
+            _restore_snapshot(root, before)
+            return _RepairAttempt(
+                RepairResult(
+                    status="failed",
+                    attempted=True,
+                    touchedFiles=changed_paths,
+                    reason="guarded Codex repair reported no_change despite modifying the repo",
+                ),
+                repaired=False,
+            )
+        if touched_files:
+            return _RepairAttempt(
+                RepairResult(
+                    status="failed",
+                    attempted=True,
+                    touchedFiles=sorted(touched_files),
+                    reason="guarded Codex repair touchedFiles did not match the actual changed files",
+                ),
+                repaired=False,
+            )
         return _RepairAttempt(
             RepairResult(
                 status="skipped",
@@ -376,9 +554,27 @@ def _repair_guarded_changes(
             ),
             repaired=False,
         )
+    if touched_files != set(changed_paths):
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(
+                status="failed",
+                attempted=True,
+                touchedFiles=sorted(touched_files),
+                reason="guarded Codex repair touchedFiles did not match the actual changed files",
+            ),
+            repaired=False,
+        )
     if not changed_paths:
         return _RepairAttempt(
             RepairResult(status="skipped", attempted=True, touchedFiles=[], reason="guarded Codex repair made no changes"),
+            repaired=False,
+        )
+    diff_reason = _guarded_same_file_diff_reason(before, after, guarded_candidates, "guarded Codex repair")
+    if diff_reason is not None:
+        _restore_snapshot(root, before)
+        return _RepairAttempt(
+            RepairResult(status="failed", attempted=True, touchedFiles=changed_paths, reason=diff_reason),
             repaired=False,
         )
     return _RepairAttempt(
@@ -393,10 +589,10 @@ def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
     file_lines: dict[str, list[str]] = {}
     original_snapshot = _snapshot_repo(root)
     guarded_applier = CodexGuardedApplier()
-
+    changed_files_since_scan: set[str] = set()
     for candidate in sorted(plan.selected_candidates, key=_candidate_sort_key):
+        reason = _candidate_support_reason(root, candidate, guarded_applier)
         if candidate.apply_mode_hint == "auto":
-            reason = _auto_support_reason(root, candidate)
             if reason is not None:
                 skipped.append(ExecutionCandidateNote(candidate=candidate, reason=reason))
                 continue
@@ -413,9 +609,21 @@ def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
             file_lines[rel_path] = updated_lines
             (root / rel_path).write_text("".join(updated_lines), encoding="utf-8")
             applied.append(candidate)
+            changed_files_since_scan.add(rel_path)
             continue
 
         if candidate.apply_mode_hint == "guarded":
+            if reason is not None:
+                skipped.append(ExecutionCandidateNote(candidate=candidate, reason=reason))
+                continue
+            if any(rel_path in changed_files_since_scan for rel_path in candidate.files):
+                skipped.append(
+                    ExecutionCandidateNote(
+                        candidate=candidate,
+                        reason="guarded candidate anchors require re-scan after earlier same-file edits",
+                    )
+                )
+                continue
             applied_guarded, reason = _apply_guarded_candidate(root, candidate, guarded_applier)
             if not applied_guarded:
                 skipped.append(
@@ -423,10 +631,11 @@ def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
                 )
                 continue
             applied.append(candidate)
+            for rel_path in candidate.files:
+                changed_files_since_scan.add(rel_path)
             continue
 
-        skipped.append(ExecutionCandidateNote(candidate=candidate, reason="report-only candidate is not applied"))
-
+        skipped.append(ExecutionCandidateNote(candidate=candidate, reason=reason or "report-only candidate is not applied"))
     changed_files = _changed_paths(original_snapshot, _snapshot_repo(root))
     return _ApplyInternalResult(
         mode=plan.mode,
@@ -445,48 +654,78 @@ def apply_plan(root: Path, plan: PlanResult) -> ApplyResult:
     return ApplyResult.model_validate(result.model_dump(by_alias=True))
 
 
-def _supports_candidate(root: Path, candidate: Candidate, guarded_applier: CodexGuardedApplier) -> bool:
-    if candidate.boundary_impact.cross_language and not candidate.boundary_impact.contract_artifacts:
-        return False
-    if candidate.apply_mode_hint == "auto":
-        return _auto_support_reason(root, candidate) is None
-    if candidate.apply_mode_hint == "guarded":
-        return guarded_applier.support_reason(root, candidate) is None
-    return False
-
-
 def report_plan(root: Path, plan: PlanResult) -> ReportResult:
     supported = 0
     supported_auto = 0
     supported_guarded = 0
     unsupported = 0
     blocked_boundary = 0
+    ready_boundary = 0
+    contract_ready = 0
+    contract_blocked = 0
     cross_language = 0
     boundary_sensitive = 0
     highest_impact = "none"
+    blocked_reasons: dict[str, None] = {}
     kinds: set[str] = set()
     guarded_applier = CodexGuardedApplier()
     git_state = inspect_git_workspace(root)
     impact_priority = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    verification_plan = VerificationPlanSummary.model_validate(
+        build_verification_report(
+            root,
+            required_checks=plan.required_checks,
+            candidates=plan.selected_candidates,
+        )
+    )
+    boundary_candidates_by_id = {
+        candidate_payload.candidate_id: candidate_payload for candidate_payload in verification_plan.boundary_candidates
+    }
+    linked_contract_artifacts = sorted(
+        {
+            artifact
+            for candidate_payload in verification_plan.boundary_candidates
+            for artifact in candidate_payload.contract_artifacts
+        }
+    )
     for candidate in plan.selected_candidates:
+        boundary_candidate = boundary_candidates_by_id.get(candidate.id)
+        boundary_sensitive_candidate = (
+            candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none"
+        )
         if candidate.boundary_impact.cross_language:
             cross_language += 1
-        if candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none":
+        if boundary_sensitive_candidate:
             boundary_sensitive += 1
         if impact_priority[candidate.boundary_impact.impact_level] > impact_priority[highest_impact]:
             highest_impact = candidate.boundary_impact.impact_level
 
-        if _supports_candidate(root, candidate, guarded_applier):
+        reason = _candidate_support_reason(root, candidate, guarded_applier)
+        if reason is None and boundary_candidate is not None and boundary_candidate.missing_predicates:
+            reason = boundary_candidate.blocked_reasons[0] if boundary_candidate.blocked_reasons else boundary_candidate.missing_predicates[0]
+        if reason is None:
             supported += 1
             kinds.add(candidate.kind)
             if candidate.apply_mode_hint == "auto":
                 supported_auto += 1
             elif candidate.apply_mode_hint == "guarded":
                 supported_guarded += 1
-        else:
-            unsupported += 1
-            if candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none":
-                blocked_boundary += 1
+            if boundary_sensitive_candidate:
+                ready_boundary += 1
+            if candidate.boundary_impact.cross_language and boundary_candidate is not None and boundary_candidate.proof_refs:
+                contract_ready += 1
+            continue
+
+        unsupported += 1
+        if boundary_sensitive_candidate:
+            blocked_boundary += 1
+            blocked_reasons.setdefault(reason, None)
+            if boundary_candidate is not None:
+                for blocked_reason in boundary_candidate.blocked_reasons:
+                    blocked_reasons.setdefault(blocked_reason, None)
+        if candidate.boundary_impact.cross_language:
+            contract_blocked += 1
+
     return ReportResult(
         mode=plan.mode,
         repo=plan.repo,
@@ -504,9 +743,17 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
             crossLanguageCandidates=cross_language,
             boundarySensitiveCandidates=boundary_sensitive,
             blockedBoundaryCandidates=blocked_boundary,
-            contractArtifacts=plan.repo.boundary_artifacts,
+            readyBoundaryCandidates=ready_boundary,
+            contractReadyCandidates=contract_ready,
+            contractBlockedCandidates=contract_blocked,
+            contractArtifacts=linked_contract_artifacts,
+            blockedReasons=list(blocked_reasons),
             highestImpact=highest_impact,
+            proofStatus=verification_plan.proof_status,
+            missingPredicates=verification_plan.missing_predicates,
+            proofRefs=verification_plan.proof_refs,
         ),
+        verificationPlan=verification_plan,
     )
 
 
@@ -540,7 +787,17 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
 
     if apply_result.status == "no_changes":
         _abort_branch_if_needed(root, git_context)
-        verification = VerificationResult(status="passed", checks=[])
+        verification = VerificationResult(
+            status="passed",
+            checks=[],
+            readiness=VerificationReadiness(
+                ready=True,
+                proofStatus="not_applicable",
+                missingPredicates=[],
+                proofRefs=[],
+            ),
+            proofRecords=[],
+        )
         return RunResult(
             mode=plan.mode,
             repo=plan.repo,
@@ -553,13 +810,14 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
             git=git_result,
         )
 
-    verification = verify_repo(root)
+
+    verification = _verify_for_execution(root, plan, apply_result.applied_candidates)
     guarded_candidates = [candidate for candidate in apply_result.applied_candidates if candidate.apply_mode_hint == "guarded"]
     if verification.status == "failed":
         repair_attempt = _repair_guarded_changes(root, guarded_candidates, verification, CodexGuardedApplier())
         repair_result = repair_attempt.result
         if repair_attempt.repaired:
-            verification = verify_repo(root)
+            verification = _verify_for_execution(root, plan, apply_result.applied_candidates)
 
     if verification.status == "failed":
         rollback_applied = _restore_snapshot(root, apply_result.original_snapshot)
@@ -582,7 +840,7 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
         except subprocess.CalledProcessError:
             rollback_applied = _restore_snapshot(root, apply_result.original_snapshot)
             _abort_branch_if_needed(root, git_context)
-            failed_verification = VerificationResult(status="failed", checks=[])
+            failed_verification = verification.model_copy(update={"status": "failed"})
             return RunResult(
                 mode=plan.mode,
                 repo=plan.repo,

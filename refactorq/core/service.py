@@ -60,7 +60,7 @@ class RefactorQService:
         candidates: list[Candidate] = []
         for adapter in adapters:
             candidates.extend(adapter.scan(root))
-        candidates = enrich_boundary_candidates(snapshot, candidates)
+        candidates = enrich_boundary_candidates(snapshot, candidates, root)
         return ScanResult(
             repo=snapshot,
             adapterNames=[adapter.name for adapter in adapters],

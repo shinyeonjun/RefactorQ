@@ -19,6 +19,37 @@ def test_python_adapter_detects_unused_import(tmp_path: Path) -> None:
     assert any(candidate.kind == "unused_import" for candidate in candidates)
 
 
+def test_python_adapter_marks_multiline_unused_import_report_only(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("from os import (\n    path,\n    getenv,\n)\n\nprint('hi')\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    unused_import = next(candidate for candidate in candidates if candidate.kind == "unused_import")
+    assert unused_import.symbols == ["path"]
+    assert unused_import.apply_mode_hint == "report_only"
+
+
+def test_python_adapter_detects_unused_private_assignment_candidate(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("_UNUSED = {\"ok\": [1, 2, 3]}\n\nprint('hi')\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    unused_symbol = next(candidate for candidate in candidates if candidate.kind == "unused_symbol")
+    assert unused_symbol.symbols == ["_UNUSED"]
+    assert unused_symbol.apply_mode_hint == "auto"
+
+
+def test_python_adapter_skips_unused_private_assignment_with_call_initializer(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("_UNUSED = dict(ok=True)\n\nprint('hi')\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert not any(candidate.kind == "unused_symbol" for candidate in candidates)
+
+
 def test_python_adapter_detects_private_dead_code(tmp_path: Path) -> None:
     sample = tmp_path / "sample.py"
     sample.write_text("def _helper():\n    return 1\n\nprint('hi')\n", encoding="utf-8")
@@ -26,6 +57,15 @@ def test_python_adapter_detects_private_dead_code(tmp_path: Path) -> None:
     candidates = PythonAdapter().scan(tmp_path)
 
     assert any(candidate.kind == "dead_code" and candidate.symbols == ["_helper"] for candidate in candidates)
+
+
+def test_python_adapter_detects_private_class_dead_code(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("class _Helper:\n    pass\n\nprint('hi')\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "dead_code" and candidate.symbols == ["_Helper"] for candidate in candidates)
 
 
 def test_python_adapter_detects_remove_abstraction_candidate(tmp_path: Path) -> None:
@@ -39,6 +79,49 @@ def test_python_adapter_detects_remove_abstraction_candidate(tmp_path: Path) -> 
     candidates = PythonAdapter().scan(tmp_path)
 
     assert any(candidate.kind == "remove_abstraction" and candidate.symbols == ["_normalize_wrapper"] for candidate in candidates)
+
+
+def test_python_adapter_detects_inline_function_candidate(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "def _normalize_value(value):\n    cleaned = value.strip()\n    return cleaned.lower()\n\n"
+        "def format_value(value):\n    return _normalize_value(value)\n",
+        encoding="utf-8",
+    )
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "inline_function" and candidate.symbols == ["_normalize_value"] for candidate in candidates)
+
+
+def test_python_adapter_skips_inline_function_for_public_helper(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "def normalize_value(value):\n    cleaned = value.strip()\n    return cleaned.lower()\n\n"
+        "def format_value(value):\n    return normalize_value(value)\n",
+        encoding="utf-8",
+    )
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert not any(candidate.kind == "inline_function" and candidate.symbols == ["normalize_value"] for candidate in candidates)
+
+
+def test_python_adapter_detects_extract_function_candidate(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    body = "\n".join([f"    value_{index} = input_value + {index}" for index in range(34)])
+    sample.write_text(
+        "def format_value(input_value):\n"
+        f"{body}\n"
+        "    return input_value\n",
+        encoding="utf-8",
+    )
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    extract_function = next(candidate for candidate in candidates if candidate.kind == "extract_function")
+    assert extract_function.symbols == ["format_value"]
+    assert extract_function.apply_mode_hint == "guarded"
 
 
 def test_python_adapter_detects_large_module_candidate(tmp_path: Path) -> None:
@@ -72,9 +155,17 @@ def test_python_adapter_detects_layer_violation_candidate(tmp_path: Path) -> Non
     candidates = PythonAdapter().scan(tmp_path)
 
     assert any(candidate.kind == "layer_violation_fix" and candidate.files == ["frontend/ui.py", "backend/service.py"] for candidate in candidates)
+    layer_violation = next(candidate for candidate in candidates if candidate.kind == "layer_violation_fix")
+    assert layer_violation.boundary_impact.impact_level == "medium"
+    assert layer_violation.boundary_impact.producer_side == ["backend/service.py"]
+    assert layer_violation.boundary_impact.consumer_side == ["frontend/ui.py"]
+
     move_symbol = next(candidate for candidate in candidates if candidate.kind == "move_symbol")
     assert move_symbol.files == ["frontend/ui.py", "backend/service.py"]
     assert move_symbol.symbols == ["service"]
+    assert move_symbol.boundary_impact.impact_level == "medium"
+    assert move_symbol.boundary_impact.producer_side == ["backend/service.py"]
+    assert move_symbol.boundary_impact.consumer_side == ["frontend/ui.py"]
 
 
 def test_python_adapter_detects_import_cycle_candidate(tmp_path: Path) -> None:
@@ -276,8 +367,67 @@ def test_ts_worker_verify_reports_semantic_failures(tmp_path: Path) -> None:
     assert statuses["typescript_typecheck"] == "failed"
 
 
-def test_ts_worker_emits_unused_symbol_candidates(tmp_path: Path) -> None:
-    (tmp_path / "unused.ts").write_text("function helper() {\n  return 1;\n}\n\nconsole.log('ok');\n", encoding="utf-8")
+def test_ts_worker_verify_preserves_command_for_generic_failures(tmp_path: Path) -> None:
+    missing_root = tmp_path / "missing"
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["verify"], "command": "verify", "root": str(missing_root)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert completed.returncode != 0
+    payload = json.loads(completed.stdout)
+
+    assert payload["ok"] is False
+    assert payload["command"] == "verify"
+    assert payload["error"]["code"] == "execution_failed"
+
+
+def test_ts_worker_marks_multiline_unused_import_report_only(tmp_path: Path) -> None:
+    (tmp_path / "multi-import.ts").write_text(
+        "import {\n"
+        "  readFile,\n"
+        "  writeFile,\n"
+        "} from \"node:fs\";\n\n"
+        "console.log(writeFile);\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    unused_import = next(candidate for candidate in payload["candidates"] if candidate["kind"] == "unused_import")
+
+    assert unused_import["symbols"] == ["readFile"]
+    assert unused_import["applyModeHint"] == "report_only"
+
+
+def test_ts_worker_emits_unused_symbol_candidates_for_module_scope(tmp_path: Path) -> None:
+    (tmp_path / "unused.ts").write_text(
+        "export {};\n\n"
+        "function helper() {\n  return 1;\n}\n\n"
+        "class HelperClass {}\n\n"
+        "const UNUSED_VALUE = { ok: true };\n\n"
+        "console.log('ok');\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.ts").write_text(
+        "console.log('consumer');\n",
+        encoding="utf-8",
+    )
 
     worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
     request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
@@ -292,7 +442,49 @@ def test_ts_worker_emits_unused_symbol_candidates(tmp_path: Path) -> None:
 
     payload = json.loads(completed.stdout)
 
-    assert any(candidate["kind"] == "unused_symbol" and candidate["symbols"] == ["helper"] for candidate in payload["candidates"])
+    unused_symbols = {
+        tuple(candidate["symbols"])
+        for candidate in payload["candidates"]
+        if candidate["kind"] == "unused_symbol"
+    }
+    assert ("helper",) in unused_symbols
+    assert ("HelperClass",) in unused_symbols
+    assert ("UNUSED_VALUE",) in unused_symbols
+
+
+def test_ts_worker_skips_unused_symbol_candidates_for_script_globals_in_multi_file_repo(tmp_path: Path) -> None:
+    (tmp_path / "globals.ts").write_text(
+        "function helper() {\n  return 1;\n}\n\n"
+        "class HelperClass {}\n\n"
+        "const UNUSED_VALUE = { ok: true };\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.ts").write_text(
+        "console.log(globalThis);\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    unused_symbols = {
+        tuple(candidate["symbols"])
+        for candidate in payload["candidates"]
+        if candidate["kind"] == "unused_symbol"
+    }
+    assert ("helper",) not in unused_symbols
+    assert ("HelperClass",) not in unused_symbols
+    assert ("UNUSED_VALUE",) not in unused_symbols
 
 def test_ts_worker_emits_remove_abstraction_candidates(tmp_path: Path) -> None:
     (tmp_path / "wrapper.ts").write_text(
@@ -315,6 +507,219 @@ def test_ts_worker_emits_remove_abstraction_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "remove_abstraction" and candidate["symbols"] == ["_normalizeWrapper"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_inline_function_candidates(tmp_path: Path) -> None:
+    (tmp_path / "inline.ts").write_text(
+        "function _normalizeValue(value: string) {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "}\n\n"
+        "function formatValue(value: string) {\n"
+        "  return _normalizeValue(value);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "inline_function" and candidate["symbols"] == ["_normalizeValue"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_extract_function_candidates_for_const_arrow(tmp_path: Path) -> None:
+    body = "\n".join([f"  const value{index} = input + {index};" for index in range(38)])
+    (tmp_path / "extract.ts").write_text(
+        "const formatValue = (input: number) => {\n"
+        f"{body}\n"
+        "  return input;\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "extract_function" and candidate["symbols"] == ["formatValue"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_duplicate_logic_candidates_for_const_arrows(tmp_path: Path) -> None:
+    (tmp_path / "dup-arrow.ts").write_text(
+        "const first = (value: string) => {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "};\n\n"
+        "const second = (value: string) => {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "duplicate_logic" and candidate["symbols"] == ["first", "second"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_remove_abstraction_candidates_for_const_arrow_wrapper(tmp_path: Path) -> None:
+    (tmp_path / "wrapper-arrow.ts").write_text(
+        "const normalize = (value: string) => value.trim().toLowerCase();\n\n"
+        "const _normalizeWrapper = (value: string) => normalize(value);\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "remove_abstraction" and candidate["symbols"] == ["_normalizeWrapper"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_inline_function_candidates_for_const_arrow(tmp_path: Path) -> None:
+    (tmp_path / "inline-arrow.ts").write_text(
+        "const _normalizeValue = (value: string) => {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "};\n\n"
+        "const formatValue = (value: string) => _normalizeValue(value);\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "inline_function" and candidate["symbols"] == ["_normalizeValue"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_skips_inline_function_for_exported_const_arrow(tmp_path: Path) -> None:
+    (tmp_path / "inline-exported.ts").write_text(
+        "export const _normalizeValue = (value: string) => {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "};\n\n"
+        "const formatValue = (value: string) => _normalizeValue(value);\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert not any(candidate["kind"] == "inline_function" and candidate["symbols"] == ["_normalizeValue"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_remove_abstraction_candidates_for_const_function_expression(tmp_path: Path) -> None:
+    (tmp_path / "wrapper-fnexpr.ts").write_text(
+        "const normalize = function(value: string) {\n"
+        "  return value.trim().toLowerCase();\n"
+        "};\n\n"
+        "const _normalizeWrapper = function(value: string) {\n"
+        "  return normalize(value);\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "remove_abstraction" and candidate["symbols"] == ["_normalizeWrapper"] for candidate in payload["candidates"])
+
+
+def test_ts_worker_emits_duplicate_logic_candidates_for_multi_declarator_const_statement(tmp_path: Path) -> None:
+    (tmp_path / "dup-multi.ts").write_text(
+        "const first = (value: string) => {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "}, second = (value: string) => {\n"
+        "  const cleaned = value.trim();\n"
+        "  return cleaned.toLowerCase();\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "duplicate_logic" and candidate["symbols"] == ["first", "second"] for candidate in payload["candidates"])
 
 def test_ts_worker_emits_large_module_candidates(tmp_path: Path) -> None:
     statements = [f"const value{index} = {index};" for index in range(20)]
@@ -357,9 +762,17 @@ def test_ts_worker_emits_layer_violation_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "layer_violation_fix" and candidate["files"] == ["frontend/ui.ts", "backend/service.ts"] for candidate in payload["candidates"])
+    layer_violation = next(candidate for candidate in payload["candidates"] if candidate["kind"] == "layer_violation_fix")
+    assert layer_violation["boundaryImpact"]["impactLevel"] == "medium"
+    assert layer_violation["boundaryImpact"]["producerSide"] == ["backend/service.ts"]
+    assert layer_violation["boundaryImpact"]["consumerSide"] == ["frontend/ui.ts"]
+
     move_symbol = next(candidate for candidate in payload["candidates"] if candidate["kind"] == "move_symbol")
     assert move_symbol["files"] == ["frontend/ui.ts", "backend/service.ts"]
     assert move_symbol["symbols"] == ["service"]
+    assert move_symbol["boundaryImpact"]["impactLevel"] == "medium"
+    assert move_symbol["boundaryImpact"]["producerSide"] == ["backend/service.ts"]
+    assert move_symbol["boundaryImpact"]["consumerSide"] == ["frontend/ui.ts"]
 
 def test_ts_worker_emits_reduce_cycle_candidates(tmp_path: Path) -> None:
     (tmp_path / "a.ts").write_text('import "./b";\nexport const a = 1;\n', encoding="utf-8")

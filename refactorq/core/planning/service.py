@@ -5,15 +5,30 @@ from typing import Iterable
 from refactorq.core.candidate import Candidate
 from refactorq.core.repo import RepoSnapshot
 
-
-from .models import ExcludedCandidate, PlanEdge, PlanMode, PlanResult
-
+from .models import ExcludedCandidate, PlanEdge, PlanMode, PlanResult, SolverProposal
 _APPLY_MODE_PRIORITY = {"auto": 0, "guarded": 1, "report_only": 2}
 _IMPACT_PRIORITY = {"none": 0, "low": 1, "medium": 2, "high": 3}
 _MODE_BATCH_LIMITS = {
     "safe": {"max_candidates": 12, "max_files": 8, "max_diff_lines": 180, "max_guarded": 0, "max_high_risk": 0},
     "balanced": {"max_candidates": 24, "max_files": 16, "max_diff_lines": 420, "max_guarded": 8, "max_high_risk": 2},
 }
+
+
+def normalize_solver_proposal(
+    *,
+    repo: RepoSnapshot,
+    adapter_names: Iterable[str],
+    candidates: Iterable[Candidate],
+) -> SolverProposal:
+    normalized_candidates: list[Candidate] = []
+    seen_candidate_ids: set[str] = set()
+    for candidate in candidates:
+        if candidate.id in seen_candidate_ids:
+            continue
+        seen_candidate_ids.add(candidate.id)
+        normalized_candidates.append(candidate)
+    normalized_adapter_names = list(dict.fromkeys(adapter_names))
+    return SolverProposal(repo=repo, adapterNames=normalized_adapter_names, candidates=normalized_candidates)
 
 
 
@@ -35,6 +50,7 @@ def _ranking_key(candidate: Candidate) -> tuple[object, ...]:
     risk = candidate.estimated_risk
     diff = candidate.estimated_diff
     return (
+        -_candidate_score(candidate),
         _APPLY_MODE_PRIORITY[candidate.apply_mode_hint],
         _IMPACT_PRIORITY[candidate.boundary_impact.impact_level],
         risk.semantic_risk,
@@ -71,7 +87,7 @@ def _is_unsupported_worker_guess(candidate: Candidate) -> bool:
 
 def _is_contract_preserving_cross_language_candidate(candidate: Candidate) -> bool:
     return (
-        candidate.kind in {"extract_function", "duplicate_logic", "remove_abstraction"}
+        candidate.kind in {"extract_function", "inline_function", "duplicate_logic", "remove_abstraction"}
         and len(candidate.files) == 1
         and candidate.scope in {"local", "module"}
     )
@@ -123,6 +139,7 @@ def _candidate_score(candidate: Candidate) -> float:
     benefit = candidate.estimated_benefit
     risk = candidate.estimated_risk
     diff = candidate.estimated_diff
+    verification_burden = len(candidate.required_checks)
     return (
         2.5 * benefit.cycle_reduction
         + 2.0 * benefit.complexity_reduction
@@ -138,6 +155,7 @@ def _candidate_score(candidate: Candidate) -> float:
         - 0.03 * diff.files_touched
         - 0.001 * _candidate_diff_lines(candidate)
         - 0.05 * _IMPACT_PRIORITY[candidate.boundary_impact.impact_level]
+        - 0.04 * verification_burden
     )
 
 
@@ -178,10 +196,9 @@ def _batch_selection_reason(
     if any(dependency_id not in selected_ids for dependency_id in candidate.dependencies):
         return 'candidate dependencies are not satisfied in the current batch'
     for current in selected:
-        if _regions_overlap(candidate, current):
-            return f'candidate overlaps already selected batch candidate {current.id}'
-        if current.id in candidate.conflicts or candidate.id in current.conflicts:
-            return f'candidate explicitly conflicts with already selected batch candidate {current.id}'
+        reason = _batch_conflict_reason(candidate, current)
+        if reason is not None:
+            return reason
     return None
 
 
@@ -197,8 +214,6 @@ def _filter_candidates(candidates: Iterable[Candidate], mode: PlanMode) -> tuple
         reason = filter_fn(candidate)
         if reason is None:
             eligible.append(candidate)
-            continue
-        if mode == "safe":
             continue
         excluded.append(ExcludedCandidate(candidate=candidate, reason=reason))
 
@@ -241,6 +256,8 @@ def _filter_candidates(candidates: Iterable[Candidate], mode: PlanMode) -> tuple
                     synergy_bonus += 0.16
                 if _is_cycle_split_synergy(candidate, current):
                     synergy_bonus += 0.14
+                if _is_layer_move_synergy(candidate, current):
+                    synergy_bonus += 0.15
             return _candidate_score(candidate) + synergy_bonus
 
         best = sorted(feasible, key=lambda candidate: (-selection_score(candidate), _ranking_key(candidate)))[0]
@@ -291,6 +308,31 @@ def _same_file_non_local(left: Candidate, right: Candidate) -> bool:
     return bool(set(left.files) & set(right.files))
 
 
+def _batch_conflict_reason(candidate: Candidate, current: Candidate) -> str | None:
+    if _regions_overlap(candidate, current):
+        return f'candidate overlaps already selected batch candidate {current.id}'
+    if current.id in candidate.conflicts or candidate.id in current.conflicts:
+        return f'candidate explicitly conflicts with already selected batch candidate {current.id}'
+    if _shared_symbol_scope(candidate, current):
+        return f'candidate shares the same symbol and scope as already selected batch candidate {current.id}'
+    if _same_file_non_local(candidate, current):
+        return f'candidate touches the same file as non-local already selected batch candidate {current.id}'
+    return None
+
+
+def _pairwise_conflict_reasons(left: Candidate, right: Candidate) -> list[str]:
+    reasons: list[str] = []
+    if _regions_overlap(left, right):
+        reasons.append("overlapping anchor regions in the same file")
+    elif _shared_symbol_scope(left, right):
+        reasons.append("same symbol in the same language scope")
+    elif _same_file_non_local(left, right):
+        reasons.append("same file touched with at least one non-local candidate")
+    if right.id in left.conflicts or left.id in right.conflicts:
+        reasons.append("explicit conflict declared by candidate")
+    return reasons
+
+
 def _conflict_edge(left: Candidate, right: Candidate, reason: str) -> PlanEdge:
     first_id, second_id = sorted((left.id, right.id))
     return PlanEdge(fromId=first_id, toId=second_id, kind="conflict", reason=reason)
@@ -300,7 +342,6 @@ def _conflict_edge(left: Candidate, right: Candidate, reason: str) -> PlanEdge:
 def _conflict_edges(candidates: list[Candidate]) -> list[PlanEdge]:
     edges: list[PlanEdge] = []
     seen: set[tuple[str, str, str]] = set()
-    by_id = {candidate.id: candidate for candidate in candidates}
 
     def add_edge(left: Candidate, right: Candidate, reason: str) -> None:
         edge = _conflict_edge(left, right, reason)
@@ -311,17 +352,8 @@ def _conflict_edges(candidates: list[Candidate]) -> list[PlanEdge]:
 
     for index, left in enumerate(candidates):
         for right in candidates[index + 1 :]:
-            if _regions_overlap(left, right):
-                add_edge(left, right, "overlapping anchor regions in the same file")
-                continue
-            if _shared_symbol_scope(left, right):
-                add_edge(left, right, "same symbol in the same language scope")
-                continue
-            if _same_file_non_local(left, right):
-                add_edge(left, right, "same file touched with at least one non-local candidate")
-        for conflict_id in left.conflicts:
-            if conflict_id in by_id and conflict_id != left.id:
-                add_edge(left, by_id[conflict_id], "explicit conflict declared by candidate")
+            for reason in _pairwise_conflict_reasons(left, right):
+                add_edge(left, right, reason)
     return edges
 
 
@@ -339,6 +371,24 @@ def _is_cycle_split_dependency(left: Candidate, right: Candidate) -> bool:
         left.kind == "split_large_module"
         and right.kind == "reduce_cycle"
         and bool(set(left.files) & set(right.files))
+    )
+
+
+def _is_move_symbol_layer_dependency(left: Candidate, right: Candidate) -> bool:
+    return (
+        left.kind == "move_symbol"
+        and right.kind == "layer_violation_fix"
+        and bool(set(left.files) & set(right.files))
+        and bool(set(left.symbols) & set(right.symbols))
+    )
+
+
+def _is_boundary_review_dependency(left: Candidate, right: Candidate) -> bool:
+    return (
+        left.boundary_impact.cross_language
+        and right.kind == "custom"
+        and right.id.startswith("boundary-review-")
+        and bool(set(left.boundary_impact.contract_artifacts) & set(right.files))
     )
 
 
@@ -366,6 +416,14 @@ def _is_cycle_split_synergy(left: Candidate, right: Candidate) -> bool:
     return kinds == {"reduce_cycle", "split_large_module"} and bool(set(left.files) & set(right.files))
 
 
+
+def _is_layer_move_synergy(left: Candidate, right: Candidate) -> bool:
+    kinds = {left.kind, right.kind}
+    return (
+        kinds == {"layer_violation_fix", "move_symbol"}
+        and bool(set(left.files) & set(right.files))
+        and bool(set(left.symbols) & set(right.symbols))
+    )
 def _synergy_edges(candidates: list[Candidate]) -> list[PlanEdge]:
     edges: list[PlanEdge] = []
     seen: set[tuple[str, str, str]] = set()
@@ -385,6 +443,8 @@ def _synergy_edges(candidates: list[Candidate]) -> list[PlanEdge]:
                 add_edge(left, right, "duplicate cleanup pairs with removing thin wrappers in the same file")
             if _is_cycle_split_synergy(left, right):
                 add_edge(left, right, "cycle reduction and module splitting reinforce the same structural cleanup")
+            if _is_layer_move_synergy(left, right):
+                add_edge(left, right, "layer boundary review and symbol relocation target the same cross-layer import")
     return edges
 
 
@@ -411,6 +471,10 @@ def _dependency_edges(candidates: list[Candidate]) -> list[PlanEdge]:
                 add_edge(candidate, other, "extract function before duplicate consolidation in the same file")
             if _is_cycle_split_dependency(candidate, other):
                 add_edge(candidate, other, "reduce cycle before splitting the related module")
+            if _is_move_symbol_layer_dependency(candidate, other):
+                add_edge(candidate, other, "review layer violation before moving the shared boundary symbol")
+            if _is_boundary_review_dependency(candidate, other):
+                add_edge(candidate, other, "review boundary contract artifact before cross-language execution")
     return edges
 
 
@@ -423,20 +487,22 @@ def _required_checks(candidates: list[Candidate]) -> list[str]:
 
 
 def build_plan(*, mode: PlanMode, repo: RepoSnapshot, adapter_names: list[str], candidates: list[Candidate]) -> PlanResult:
-    selected, excluded = _filter_candidates(candidates, mode)
-    edges = _conflict_edges(selected)
-    edges.extend(_dependency_edges(selected))
-    edges.extend(_synergy_edges(selected))
+    proposal = normalize_solver_proposal(repo=repo, adapter_names=adapter_names, candidates=candidates)
+    selected, excluded = _filter_candidates(proposal.candidates, mode)
+    edge_candidates = [*selected, *[item.candidate for item in excluded]]
+    edges = _conflict_edges(edge_candidates)
+    edges.extend(_dependency_edges(edge_candidates))
+    edges.extend(_synergy_edges(edge_candidates))
     ordered_edges = sorted(edges, key=lambda edge: (edge.kind, edge.from_id, edge.to_id, edge.reason))
     return PlanResult(
         mode=mode,
-        repo=repo,
-        adapterNames=adapter_names,
+        repo=proposal.repo,
+        adapterNames=proposal.adapter_names,
         selectedCandidates=selected,
         excludedCandidates=excluded,
         edges=ordered_edges,
         requiredChecks=_required_checks(selected),
-        candidateCount=len(candidates),
+        candidateCount=len(proposal.candidates),
         selectedCount=len(selected),
         excludedCount=len(excluded),
     )

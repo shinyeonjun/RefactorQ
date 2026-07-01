@@ -8,6 +8,7 @@ from refactorq.core.candidate import Candidate
 from refactorq.core.repo import RepoSnapshot
 
 PlanMode = Literal["safe", "balanced", "report"]
+ProposalAuthority = Literal["solver_proposal"]
 
 
 class PlanEdge(BaseModel):
@@ -20,6 +21,13 @@ class PlanEdge(BaseModel):
 class ExcludedCandidate(BaseModel):
     candidate: Candidate
     reason: str
+
+
+class SolverProposal(BaseModel):
+    authority: ProposalAuthority = "solver_proposal"
+    repo: RepoSnapshot
+    adapter_names: list[str] = Field(default_factory=list, alias="adapterNames")
+    candidates: list[Candidate] = Field(default_factory=list)
 
 
 class PlanResult(BaseModel):
