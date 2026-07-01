@@ -95,13 +95,13 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function" | "split_large_module";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "split_large_module" | "reduce_cycle";
 
   title: string;
   description: string;
   language: "typescript";
-  scope: "local" | "module";
-  source: Array<"static" | "metric">;
+  scope: "local" | "module" | "package";
+  source: Array<"static" | "metric" | "graph">;
   files: string[];
   symbols: string[];
   anchorRegions: Array<{ file: string; startLine: number; endLine: number }>;
@@ -421,6 +421,141 @@ function buildLargeModuleCandidates(sourceFile: ts.SourceFile, root: string): Ca
   }];
 }
 
+function resolveLocalImport(specifier: string, importer: string, knownFiles: Set<string>): string | null {
+  if (!specifier.startsWith(".")) {
+    return null;
+  }
+  const base = resolve(importer, "..", specifier);
+  const candidates = [
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    join(base, "index.ts"),
+    join(base, "index.tsx"),
+    join(base, "index.js"),
+    join(base, "index.jsx"),
+  ];
+  for (const candidate of candidates) {
+    if (knownFiles.has(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function stronglyConnectedComponents(root: string, graph: Map<string, Set<string>>): string[][] {
+  let index = 0;
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const indices = new Map<string, number>();
+  const lowlinks = new Map<string, number>();
+  const components: string[][] = [];
+
+  const visit = (node: string): void => {
+    indices.set(node, index);
+    lowlinks.set(node, index);
+    index += 1;
+    stack.push(node);
+    onStack.add(node);
+
+    for (const neighbor of graph.get(node) ?? []) {
+      if (!indices.has(neighbor)) {
+        visit(neighbor);
+        lowlinks.set(node, Math.min(lowlinks.get(node) ?? 0, lowlinks.get(neighbor) ?? 0));
+      } else if (onStack.has(neighbor)) {
+        lowlinks.set(node, Math.min(lowlinks.get(node) ?? 0, indices.get(neighbor) ?? 0));
+      }
+    }
+
+    if ((lowlinks.get(node) ?? 0) !== (indices.get(node) ?? 0)) {
+      return;
+    }
+
+    const component: string[] = [];
+    while (stack.length > 0) {
+      const member = stack.pop();
+      if (!member) {
+        break;
+      }
+      onStack.delete(member);
+      component.push(member);
+      if (member === node) {
+        break;
+      }
+    }
+    components.push(component.sort((left, right) => relativePosix(root, left).localeCompare(relativePosix(root, right))));
+  };
+
+  for (const node of [...graph.keys()].sort((left, right) => relativePosix(root, left).localeCompare(relativePosix(root, right)))) {
+    if (!indices.has(node)) {
+      visit(node);
+    }
+  }
+  return components;
+}
+
+function buildCycleCandidates(root: string, files: string[], program: ts.Program): CandidatePayload[] {
+  const knownFiles = new Set(files);
+  const graph = new Map<string, Set<string>>();
+  for (const fileName of files) {
+    graph.set(fileName, new Set<string>());
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile || sourceFile.isDeclarationFile) {
+      continue;
+    }
+    for (const statement of sourceFile.statements) {
+      if (!ts.isImportDeclaration(statement)) {
+        continue;
+      }
+      if (!ts.isStringLiteral(statement.moduleSpecifier)) {
+        continue;
+      }
+      const target = resolveLocalImport(statement.moduleSpecifier.text, fileName, knownFiles);
+      if (target) {
+        graph.get(fileName)?.add(target);
+      }
+    }
+  }
+
+  return stronglyConnectedComponents(root, graph)
+    .filter((component) => component.length > 1)
+    .map((component) => {
+      const relFiles = component.map((fileName) => relativePosix(root, fileName));
+      const cycleId = relFiles.join("-").replaceAll("/", "-").replaceAll(".", "-");
+      return {
+        id: `ts-reduce-cycle-${cycleId}`,
+        kind: "reduce_cycle",
+        title: `Reduce import cycle across ${relFiles.length} TypeScript modules`,
+        description: `TypeScript import cycle detected across ${relFiles.map((fileName) => `\`${fileName}\``).join(", ")}`,
+        language: "typescript",
+        scope: "package",
+        source: ["graph"],
+        files: relFiles,
+        symbols: relFiles,
+        anchorRegions: [],
+        estimatedBenefit: { cycleReduction: 1, maintainabilityGain: 0.38 },
+        estimatedRisk: { semanticRisk: 0.42, testRisk: 0.28, conflictRisk: 0.24 },
+        estimatedDiff: {
+          filesTouched: relFiles.length,
+          linesAdded: Math.max(4, relFiles.length * 3),
+          linesModified: Math.max(2, relFiles.length * 4),
+        },
+        contextSignals: createEmptyContextSignals(),
+        boundaryImpact: createEmptyBoundaryImpact(),
+        confidence: 0.74,
+        applyModeHint: "report_only",
+        requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+        dependencies: [],
+        conflicts: [],
+        provenance: {
+          detectors: ["ts-worker-import-graph-cycle"],
+          evidence: relFiles.map((fileName) => `file:${fileName}`),
+        },
+      };
+    });
+}
+
 function buildUnusedSymbolCandidates(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
@@ -536,6 +671,7 @@ function scan(rootArg: string): WorkerScanSuccess {
     candidates.push(...buildUnusedSymbolCandidates(checker, sourceFile, root));
     candidates.push(...buildLongFunctionCandidates(sourceFile, root));
     candidates.push(...buildLargeModuleCandidates(sourceFile, root));
+    candidates.push(...buildCycleCandidates(root, files, program));
   }
 
   return {

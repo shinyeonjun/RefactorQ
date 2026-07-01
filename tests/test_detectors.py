@@ -37,6 +37,18 @@ def test_python_adapter_detects_large_module_candidate(tmp_path: Path) -> None:
     assert any(candidate.kind == "split_large_module" and candidate.files == ["large_module.py"] for candidate in candidates)
 
 
+def test_python_adapter_detects_import_cycle_candidate(tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "a.py").write_text("from . import b\n", encoding="utf-8")
+    (package / "b.py").write_text("from . import a\n", encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "reduce_cycle" and candidate.files == ["pkg/a.py", "pkg/b.py"] for candidate in candidates)
+
+
 
 def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "sample.ts"
@@ -260,3 +272,22 @@ def test_ts_worker_emits_large_module_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "split_large_module" and candidate["files"] == ["large.ts"] for candidate in payload["candidates"])
+
+def test_ts_worker_emits_reduce_cycle_candidates(tmp_path: Path) -> None:
+    (tmp_path / "a.ts").write_text('import "./b";\nexport const a = 1;\n', encoding="utf-8")
+    (tmp_path / "b.ts").write_text('import "./a";\nexport const b = 1;\n', encoding="utf-8")
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "reduce_cycle" and candidate["files"] == ["a.ts", "b.ts"] for candidate in payload["candidates"])
