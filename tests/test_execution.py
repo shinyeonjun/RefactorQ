@@ -117,6 +117,59 @@ def test_balanced_apply_uses_guarded_codex_flow(tmp_path: Path, monkeypatch: Mon
     assert "_very_long_function_impl" in sample.read_text(encoding="utf-8")
 
 
+def test_balanced_apply_executes_low_impact_cross_language_auto_candidate(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\n", encoding="utf-8")
+    sample = backend / "api.py"
+    sample.write_text("import os\n\nprint('ok')\n", encoding="utf-8")
+    (frontend / "client.ts").write_text("console.log('ok');\n", encoding="utf-8")
+
+    result = RefactorQService().run(tmp_path, "balanced")
+
+    assert result.status == "passed"
+    assert [candidate.id for candidate in result.apply.applied_candidates] == ["py-unused-import-backend/api.py-1-os"]
+    assert any(check.name == "boundary_contracts" and check.status == "passed" for check in result.verification.checks)
+    assert sample.read_text(encoding="utf-8") == "\nprint('ok')\n"
+
+
+def test_balanced_apply_uses_guarded_duplicate_logic_flow(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "def first(value):\n    normalized = value.strip()\n    return normalized.lower()\n\n"
+        "def second(value):\n    normalized = value.strip()\n    return normalized.lower()\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.is_available", lambda self: True)
+
+    def fake_apply(self: CodexGuardedApplier, root: Path, candidate: Candidate) -> GuardedApplyResult:
+        target = root / candidate.files[0]
+        target.write_text(
+            "def _normalize_value(value):\n    normalized = value.strip()\n    return normalized.lower()\n\n"
+            "def first(value):\n    return _normalize_value(value)\n\n"
+            "def second(value):\n    return _normalize_value(value)\n",
+            encoding="utf-8",
+        )
+        return GuardedApplyResult(
+            status="applied",
+            touchedFiles=[candidate.files[0]],
+            summary=["consolidated duplicate logic"],
+            details={"candidate": candidate.id},
+        )
+
+    monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
+
+    result = RefactorQService().apply(tmp_path, "balanced")
+
+    assert result.status == "applied"
+    assert result.changed_files == ["sample.py"]
+    assert [candidate.kind for candidate in result.applied_candidates] == ["duplicate_logic"]
+    assert "_normalize_value" in sample.read_text(encoding="utf-8")
+
+
 
 def test_balanced_apply_rejects_guarded_scope_expansion(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "sample.py"

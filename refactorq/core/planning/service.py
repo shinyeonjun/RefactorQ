@@ -80,10 +80,15 @@ def _safe_filter(candidate: Candidate) -> str | None:
 def _balanced_filter(candidate: Candidate) -> str | None:
     if candidate.apply_mode_hint == "report_only":
         return "report-only candidate retained as explanatory exclusion"
-    if _is_cross_language(candidate):
-        return "cross-language candidate retained as report until boundary-aware execution lands"
     if _is_boundary_changing(candidate):
         return "boundary-changing candidate requires stronger verification than balanced mode baseline"
+    if _is_cross_language(candidate):
+        if candidate.boundary_impact.impact_level != "low":
+            return "cross-language candidate requires lower boundary impact before balanced execution"
+        if candidate.apply_mode_hint != "auto":
+            return "guarded cross-language candidate retained as report until guarded boundary execution is stronger"
+        if not _has_required_checks(candidate):
+            return "cross-language candidate is missing required checks"
     if _is_unsupported_worker_guess(candidate):
         return "unsupported TypeScript bridge guess excluded until worker-backed semantics are available"
     return None
@@ -168,21 +173,51 @@ def _conflict_edges(candidates: list[Candidate]) -> list[PlanEdge]:
     return edges
 
 
+def _is_duplicate_extract_dependency(left: Candidate, right: Candidate) -> bool:
+    return (
+        left.kind == "duplicate_logic"
+        and right.kind == "extract_function"
+        and bool(set(left.files) & set(right.files))
+        and bool(set(left.symbols) & set(right.symbols))
+    )
+
+
+def _is_cycle_split_dependency(left: Candidate, right: Candidate) -> bool:
+    return (
+        left.kind == "split_large_module"
+        and right.kind == "reduce_cycle"
+        and bool(set(left.files) & set(right.files))
+    )
+
+
+def _dependency_edge(from_candidate: Candidate, to_candidate: Candidate, reason: str) -> PlanEdge:
+    return PlanEdge(fromId=from_candidate.id, toId=to_candidate.id, kind="dependency", reason=reason)
+
+
+
 def _dependency_edges(candidates: list[Candidate]) -> list[PlanEdge]:
     by_id = {candidate.id: candidate for candidate in candidates}
     edges: list[PlanEdge] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_edge(from_candidate: Candidate, to_candidate: Candidate, reason: str) -> None:
+        edge = _dependency_edge(from_candidate, to_candidate, reason)
+        key = (edge.from_id, edge.to_id, edge.reason)
+        if key not in seen:
+            seen.add(key)
+            edges.append(edge)
+
     for candidate in candidates:
         for dependency_id in candidate.dependencies:
-            if dependency_id not in by_id:
+            if dependency_id in by_id:
+                add_edge(candidate, by_id[dependency_id], "explicit dependency declared by candidate")
+        for other in candidates:
+            if candidate.id == other.id:
                 continue
-            edges.append(
-                PlanEdge(
-                    fromId=candidate.id,
-                    toId=dependency_id,
-                    kind="dependency",
-                    reason="explicit dependency declared by candidate",
-                )
-            )
+            if _is_duplicate_extract_dependency(candidate, other):
+                add_edge(candidate, other, "extract function before duplicate consolidation in the same file")
+            if _is_cycle_split_dependency(candidate, other):
+                add_edge(candidate, other, "reduce cycle before splitting the related module")
     return edges
 
 

@@ -107,7 +107,8 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
     candidates = [
         _candidate("auto-ok"),
         _candidate("guarded-ok", apply_mode_hint="guarded"),
-        _candidate("cross-language", cross_language=True, impact_level="low", files=["frontend/client.ts"]),
+        _candidate("cross-language-low", cross_language=True, impact_level="low", files=["frontend/client.ts"]),
+        _candidate("cross-language-medium", cross_language=True, impact_level="medium", files=["backend/api.py"]),
         _candidate("report-only", apply_mode_hint="report_only"),
         _candidate(
             "bridge-guess",
@@ -118,11 +119,11 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
 
     result = build_plan(mode="balanced", repo=_repo_snapshot(), adapter_names=["python"], candidates=candidates)
 
-    assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "guarded-ok"]
+    assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "cross-language-low", "guarded-ok"]
     excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
     assert (
-        excluded["cross-language"]
-        == "cross-language candidate retained as report until boundary-aware execution lands"
+        excluded["cross-language-medium"]
+        == "cross-language candidate requires lower boundary impact before balanced execution"
     )
     assert excluded["report-only"] == "report-only candidate retained as explanatory exclusion"
     assert (
@@ -231,6 +232,86 @@ def test_plan_surfaces_conflict_and_dependency_edges() -> None:
         "same-symbol",
         "shared-region",
         "explicit dependency declared by candidate",
+    ) in dependency_edges
+
+
+def test_plan_adds_duplicate_extract_and_cycle_split_dependencies() -> None:
+    duplicate = Candidate.model_validate(
+        {
+            **_candidate(
+                "duplicate-same-symbol",
+                files=["src/shared.py"],
+                symbols=["helper", "other"],
+                scope="module",
+                apply_mode_hint="guarded",
+            ).model_dump(by_alias=True),
+            "kind": "duplicate_logic",
+            "anchorRegions": [
+                {"file": "src/shared.py", "startLine": 5, "endLine": 8},
+                {"file": "src/shared.py", "startLine": 20, "endLine": 23},
+            ],
+        }
+    )
+    extract = Candidate.model_validate(
+        {
+            **_candidate(
+                "extract-same-symbol",
+                files=["src/shared.py"],
+                symbols=["helper"],
+                start_line=5,
+                end_line=30,
+                apply_mode_hint="guarded",
+            ).model_dump(by_alias=True),
+            "kind": "extract_function",
+        }
+    )
+    split = Candidate.model_validate(
+        {
+            **_candidate(
+                "split-module",
+                files=["src/shared.py"],
+                scope="module",
+                apply_mode_hint="report_only",
+            ).model_dump(by_alias=True),
+            "kind": "split_large_module",
+            "anchorRegions": [],
+        }
+    )
+    cycle = Candidate.model_validate(
+        {
+            **_candidate(
+                "reduce-cycle",
+                files=["src/shared.py", "src/other.py"],
+                scope="package",
+                apply_mode_hint="report_only",
+                symbols=["pkg.shared", "pkg.other"],
+            ).model_dump(by_alias=True),
+            "kind": "reduce_cycle",
+            "anchorRegions": [],
+        }
+    )
+
+    result = build_plan(
+        mode="report",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[duplicate, extract, split, cycle],
+    )
+
+    dependency_edges = {
+        (edge.from_id, edge.to_id, edge.reason)
+        for edge in result.edges
+        if edge.kind == "dependency"
+    }
+    assert (
+        "duplicate-same-symbol",
+        "extract-same-symbol",
+        "extract function before duplicate consolidation in the same file",
+    ) in dependency_edges
+    assert (
+        "split-module",
+        "reduce-cycle",
+        "reduce cycle before splitting the related module",
     ) in dependency_edges
 
 
