@@ -43,6 +43,7 @@ def _candidate(
     cross_language: bool = False,
     provenance_detectors: list[str] | None = None,
     dependencies: list[str] | None = None,
+    conflicts: list[str] | None = None,
 ) -> Candidate:
     return Candidate.model_validate(
         {
@@ -80,7 +81,7 @@ def _candidate(
             "applyModeHint": apply_mode_hint,
             "requiredChecks": ["parse", "lint"] if required_checks is None else required_checks,
             "dependencies": dependencies or [],
-            "conflicts": [],
+            "conflicts": conflicts or [],
             "provenance": {"detectors": provenance_detectors or ["unit-test-detector"], "evidence": []},
         }
     )
@@ -145,6 +146,36 @@ def test_report_mode_preserves_deterministic_ranking_order() -> None:
     ]
 
 
+def test_report_mode_prefers_higher_cycle_reduction_when_risk_matches() -> None:
+    maintainability_only = _candidate(
+        "maintainability-only",
+        files=["src/a.py"],
+        confidence=0.8,
+        maintainability_gain=0.2,
+    )
+    cycle_first = Candidate.model_validate(
+        {
+            **_candidate(
+                "cycle-first",
+                files=["src/b.py"],
+                confidence=0.8,
+                maintainability_gain=0.2,
+            ).model_dump(by_alias=True),
+            "estimatedBenefit": {"cycleReduction": 1.0, "maintainabilityGain": 0.2},
+        }
+    )
+
+    result = build_plan(
+        mode="report",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[maintainability_only, cycle_first],
+    )
+
+    assert [candidate.id for candidate in result.selected_candidates] == ["cycle-first", "maintainability-only"]
+
+
+
 def test_plan_surfaces_conflict_and_dependency_edges() -> None:
     selected = [
         _candidate("shared-region", files=["src/shared.py"], symbols=["alpha"], start_line=10, end_line=20),
@@ -164,6 +195,7 @@ def test_plan_surfaces_conflict_and_dependency_edges() -> None:
             scope="module",
             start_line=30,
             end_line=40,
+            conflicts=["same-symbol"],
         ),
     ]
 
@@ -190,6 +222,10 @@ def test_plan_surfaces_conflict_and_dependency_edges() -> None:
     assert (
         frozenset(("shared-region", "module-touch")),
         "same file touched with at least one non-local candidate",
+    ) in conflict_edges
+    assert (
+        frozenset(("module-touch", "same-symbol")),
+        "explicit conflict declared by candidate",
     ) in conflict_edges
     assert (
         "same-symbol",

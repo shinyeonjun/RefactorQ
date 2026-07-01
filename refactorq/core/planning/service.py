@@ -9,26 +9,40 @@ from refactorq.core.repo import RepoSnapshot
 from .models import ExcludedCandidate, PlanEdge, PlanMode, PlanResult
 
 _APPLY_MODE_PRIORITY = {"auto": 0, "guarded": 1, "report_only": 2}
+_IMPACT_PRIORITY = {"none": 0, "low": 1, "medium": 2, "high": 3}
+
 
 
 def _first_file(candidate: Candidate) -> str:
     return candidate.files[0] if candidate.files else ""
 
 
+def _benefit_tuple(candidate: Candidate) -> tuple[float, float, float, float, float]:
+    benefit = candidate.estimated_benefit
+    return (
+        -benefit.cycle_reduction,
+        -benefit.complexity_reduction,
+        -benefit.duplication_reduction,
+        -benefit.maintainability_gain,
+        -benefit.perf_gain,
+    )
+
 def _ranking_key(candidate: Candidate) -> tuple[object, ...]:
     risk = candidate.estimated_risk
     diff = candidate.estimated_diff
-    benefit = candidate.estimated_benefit
     return (
         _APPLY_MODE_PRIORITY[candidate.apply_mode_hint],
+        _IMPACT_PRIORITY[candidate.boundary_impact.impact_level],
         risk.semantic_risk,
         risk.api_risk,
         risk.runtime_risk,
         risk.conflict_risk,
         -candidate.confidence,
-        -benefit.maintainability_gain,
+        *_benefit_tuple(candidate),
         diff.files_touched,
         diff.lines_modified,
+        diff.lines_added,
+        diff.lines_deleted,
         _first_file(candidate),
         candidate.id,
     )
@@ -128,16 +142,29 @@ def _conflict_edge(left: Candidate, right: Candidate, reason: str) -> PlanEdge:
 
 def _conflict_edges(candidates: list[Candidate]) -> list[PlanEdge]:
     edges: list[PlanEdge] = []
+    seen: set[tuple[str, str, str]] = set()
+    by_id = {candidate.id: candidate for candidate in candidates}
+
+    def add_edge(left: Candidate, right: Candidate, reason: str) -> None:
+        edge = _conflict_edge(left, right, reason)
+        key = (edge.from_id, edge.to_id, edge.reason)
+        if key not in seen:
+            seen.add(key)
+            edges.append(edge)
+
     for index, left in enumerate(candidates):
         for right in candidates[index + 1 :]:
             if _regions_overlap(left, right):
-                edges.append(_conflict_edge(left, right, "overlapping anchor regions in the same file"))
+                add_edge(left, right, "overlapping anchor regions in the same file")
                 continue
             if _shared_symbol_scope(left, right):
-                edges.append(_conflict_edge(left, right, "same symbol in the same language scope"))
+                add_edge(left, right, "same symbol in the same language scope")
                 continue
             if _same_file_non_local(left, right):
-                edges.append(_conflict_edge(left, right, "same file touched with at least one non-local candidate"))
+                add_edge(left, right, "same file touched with at least one non-local candidate")
+        for conflict_id in left.conflicts:
+            if conflict_id in by_id and conflict_id != left.id:
+                add_edge(left, by_id[conflict_id], "explicit conflict declared by candidate")
     return edges
 
 
