@@ -46,21 +46,19 @@ def apply(
 
 
 @app.command()
-def verify(
-    repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
-) -> None:
+def verify(repo: str = typer.Argument(...)) -> None:
     """Run structural verification for supported repository languages."""
-    result = service.verify(repo)
+    result = service.verify_source(repo)
     _emit_json(result.model_dump(by_alias=True))
 
 
 @app.command()
 def report(
-    repo: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
-    mode: PlanMode = typer.Option("report", "--mode"),
+    repo: str = typer.Argument(...),
+    mode: PlanMode = typer.Option("report", "--mode", case_sensitive=False),
 ) -> None:
     """Summarize plan output and current deterministic execution support."""
-    result = service.report(repo, mode)
+    result = service.report_source(repo, mode)
     _emit_json(result.model_dump(by_alias=True))
 
 

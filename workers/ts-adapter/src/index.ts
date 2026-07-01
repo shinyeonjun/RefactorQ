@@ -6,6 +6,7 @@ const PROTOCOL_VERSION = 1;
 const PROTOCOL_CAPABILITIES = ["scan", "verify", "deterministic-ordering", "typescript-semantic-candidates"];
 const LONG_FUNCTION_THRESHOLD = 40;
 const LARGE_MODULE_THRESHOLD = 300;
+const DUPLICATE_FUNCTION_MIN_LINES = 3;
 const TOP_LEVEL_STATEMENT_THRESHOLD = 18;
 const IGNORED = new Set([
   ".git",
@@ -95,22 +96,24 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function" | "split_large_module" | "reduce_cycle";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "duplicate_logic" | "split_large_module" | "reduce_cycle";
 
   title: string;
   description: string;
   language: "typescript";
   scope: "local" | "module" | "package";
-  source: Array<"static" | "metric" | "graph">;
+  source: Array<"static" | "clone" | "metric" | "graph">;
   files: string[];
   symbols: string[];
   anchorRegions: Array<{ file: string; startLine: number; endLine: number }>;
   estimatedBenefit: {
     complexityReduction?: number;
+    duplicationReduction?: number;
     maintainabilityGain?: number;
   };
   estimatedRisk: {
     semanticRisk: number;
+    apiRisk?: number;
     testRisk?: number;
     conflictRisk: number;
   };
@@ -209,6 +212,24 @@ function sortCandidates(candidates: CandidatePayload[]): CandidatePayload[] {
     }
     return left.id.localeCompare(right.id);
   });
+}
+
+function lineSpan(sourceFile: ts.SourceFile, node: ts.Node): { startLine: number; endLine: number; length: number } {
+  const startLine = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+  const endLine = sourceFile.getLineAndCharacterOfPosition(node.end).line + 1;
+  return { startLine, endLine, length: endLine - startLine + 1 };
+}
+
+function duplicateFunctionKey(sourceFile: ts.SourceFile, node: ts.FunctionDeclaration): string | null {
+  if (!node.body) {
+    return null;
+  }
+  const parameters = node.parameters.map((parameter) => parameter.getText(sourceFile).replace(/\s+/g, " ").trim()).join(",");
+  const body = node.body.statements.map((statement) => statement.getText(sourceFile).replace(/\s+/g, " ").trim()).join(";");
+  if (!body) {
+    return null;
+  }
+  return `${parameters}|${body}`;
 }
 
 function isImportedIdentifier(node: ts.Identifier): boolean {
@@ -419,6 +440,73 @@ function buildLargeModuleCandidates(sourceFile: ts.SourceFile, root: string): Ca
       evidence: [`line_span:${totalLines}`, `top_level_statements:${topLevelStatements}`],
     },
   }];
+}
+
+function buildDuplicateFunctionCandidates(sourceFile: ts.SourceFile, root: string): CandidatePayload[] {
+  const relPath = relativePosix(root, sourceFile.fileName);
+  const groups = new Map<string, Array<{ name: string; startLine: number; endLine: number; length: number }>>();
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isFunctionDeclaration(statement) || !statement.name || !statement.body) {
+      continue;
+    }
+    const duplicateKey = duplicateFunctionKey(sourceFile, statement);
+    if (!duplicateKey) {
+      continue;
+    }
+    const span = lineSpan(sourceFile, statement);
+    const entry = {
+      name: statement.name.text,
+      startLine: span.startLine,
+      endLine: span.endLine,
+      length: span.length,
+    };
+    groups.set(duplicateKey, [...(groups.get(duplicateKey) ?? []), entry]);
+  }
+
+  const candidates: CandidatePayload[] = [];
+  for (const functions of [...groups.values()].sort((left, right) => left[0]!.startLine - right[0]!.startLine)) {
+    if (functions.length < 2) {
+      continue;
+    }
+    if (Math.max(...functions.map((entry) => entry.length)) < DUPLICATE_FUNCTION_MIN_LINES) {
+      continue;
+    }
+    const symbols = functions.map((entry) => entry.name);
+    const totalLines = functions.reduce((sum, entry) => sum + entry.length, 0);
+    candidates.push({
+      id: `ts-duplicate-logic-${relPath}-${functions[0]!.startLine}-${functions.length}`,
+      kind: "duplicate_logic",
+      title: `Consolidate duplicate TypeScript functions in ${relPath}`,
+      description: `Functions ${symbols.map((symbol) => `\`${symbol}\``).join(", ")} in ${relPath} share the same structure and are candidates for consolidation`,
+      language: "typescript",
+      scope: "module",
+      source: ["clone", "metric"],
+      files: [relPath],
+      symbols,
+      anchorRegions: functions.map((entry) => ({ file: relPath, startLine: entry.startLine, endLine: entry.endLine })),
+      estimatedBenefit: { duplicationReduction: Math.min(1, functions.length / 3), maintainabilityGain: 0.42 },
+      estimatedRisk: { semanticRisk: 0.28, apiRisk: 0.12, testRisk: 0.22, conflictRisk: 0.18 },
+      estimatedDiff: {
+        filesTouched: 1,
+        linesAdded: Math.max(3, Math.floor(totalLines / 6)),
+        linesModified: totalLines,
+      },
+      contextSignals: createEmptyContextSignals(),
+      boundaryImpact: createEmptyBoundaryImpact(),
+      confidence: 0.74,
+      applyModeHint: "guarded",
+      requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+      dependencies: [],
+      conflicts: [],
+      provenance: {
+        detectors: ["ts-worker-duplicate-function"],
+        evidence: symbols.map((symbol) => `symbol:${symbol}`).concat(`duplicateGroupSize:${functions.length}`),
+      },
+    });
+  }
+
+  return candidates;
 }
 
 function resolveLocalImport(specifier: string, importer: string, knownFiles: Set<string>): string | null {
@@ -671,8 +759,9 @@ function scan(rootArg: string): WorkerScanSuccess {
     candidates.push(...buildUnusedSymbolCandidates(checker, sourceFile, root));
     candidates.push(...buildLongFunctionCandidates(sourceFile, root));
     candidates.push(...buildLargeModuleCandidates(sourceFile, root));
-    candidates.push(...buildCycleCandidates(root, files, program));
+    candidates.push(...buildDuplicateFunctionCandidates(sourceFile, root));
   }
+  candidates.push(...buildCycleCandidates(root, files, program));
 
   return {
     protocolVersion: PROTOCOL_VERSION,

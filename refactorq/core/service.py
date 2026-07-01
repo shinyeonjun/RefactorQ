@@ -55,8 +55,16 @@ class RefactorQService:
     def apply(self, root: Path, mode: PlanMode) -> ApplyResult:
         return apply_plan(root, self.plan(root, mode))
 
+    def verify_source(self, source: str | Path) -> VerificationResult:
+        with normalize_repo_source(source) as repo_source:
+            return self.verify(repo_source.analysis_root)
+
     def verify(self, root: Path) -> VerificationResult:
         return verify_repo(root)
+
+    def report_source(self, source: str | Path, mode: PlanMode) -> ReportResult:
+        with normalize_repo_source(source) as repo_source:
+            return self.report(repo_source.analysis_root, mode)
 
     def report(self, root: Path, mode: PlanMode) -> ReportResult:
         return report_plan(root, self.plan(root, mode))

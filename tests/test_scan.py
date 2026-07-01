@@ -12,6 +12,7 @@ from refactorq.cli.main import app
 from refactorq.core.repo import RepoManifestMap, RepoSnapshot, detect_repo
 from refactorq.core.repo_source import normalize_repo_source
 from refactorq.core.service import RefactorQService
+from refactorq.core.verification import VerificationResult
 import refactorq.core.repo_source.source as repo_source_module
 import refactorq.core.service as service_module
 
@@ -143,6 +144,42 @@ def test_plan_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path
     assert calls["source"] == "https://github.com/acme/project"
     assert 'selectedCandidates' in result.stdout
 
+
+def test_verify_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+
+    @contextmanager
+    def fake_normalize(source: str | Path) -> Iterator[SimpleNamespace]:
+        calls["source"] = source
+        yield SimpleNamespace(analysis_root=tmp_path)
+
+    monkeypatch.setattr(service_module, "normalize_repo_source", fake_normalize)
+    monkeypatch.setattr(service_module, "verify_repo", lambda root: VerificationResult(status="passed", checks=[]))
+
+    result = runner.invoke(app, ["verify", "https://github.com/acme/project"])
+
+    assert result.exit_code == 0, result.stdout
+    assert calls["source"] == "https://github.com/acme/project"
+    assert '"status": "passed"' in result.stdout
+
+
+def test_report_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+
+    @contextmanager
+    def fake_normalize(source: str | Path) -> Iterator[SimpleNamespace]:
+        calls["source"] = source
+        yield SimpleNamespace(analysis_root=tmp_path)
+
+    monkeypatch.setattr(service_module, "normalize_repo_source", fake_normalize)
+    monkeypatch.setattr(service_module, "detect_repo", _repo_snapshot)
+    monkeypatch.setattr(service_module, "detect_adapters", lambda root: [])
+
+    result = runner.invoke(app, ["report", "https://github.com/acme/project"])
+
+    assert result.exit_code == 0, result.stdout
+    assert calls["source"] == "https://github.com/acme/project"
+    assert '"executionSupport"' in result.stdout
 
 def test_deferred_cleanup_runs_on_next_normalization(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     deferred_record = tmp_path / "cleanup.json"

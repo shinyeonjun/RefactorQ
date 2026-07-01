@@ -18,6 +18,7 @@ from refactorq.core.filesystem import walk_source_files
 LONG_FUNCTION_THRESHOLD = 35
 LARGE_MODULE_THRESHOLD = 300
 TOP_LEVEL_STATEMENT_THRESHOLD = 18
+DUPLICATE_FUNCTION_MIN_LINES = 3
 
 
 def _region(file: str, start_line: int, end_line: int) -> AnchorRegion:
@@ -34,6 +35,79 @@ def _risk(payload: dict[str, float]) -> EstimatedRisk:
 
 def _diff(payload: dict[str, int]) -> EstimatedDiff:
     return EstimatedDiff.model_validate(payload)
+
+
+def _duplicate_function_key(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    args_dump = ast.dump(node.args, annotate_fields=False, include_attributes=False)
+    body_dump = ast.dump(ast.Module(body=node.body, type_ignores=[]), annotate_fields=False, include_attributes=False)
+    return f"{args_dump}|{body_dump}"
+
+
+def _build_duplicate_candidates(
+    rel_path: str,
+    duplicates: list[tuple[str, int, int, str]],
+) -> list[Candidate]:
+    by_key: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+    for name, start_line, end_line, duplicate_key in duplicates:
+        by_key[duplicate_key].append((name, start_line, end_line))
+
+    candidates: list[Candidate] = []
+    for duplicate_key, functions in sorted(by_key.items()):
+        if len(functions) < 2:
+            continue
+        line_spans = [end_line - start_line + 1 for _, start_line, end_line in functions]
+        if max(line_spans) < DUPLICATE_FUNCTION_MIN_LINES:
+            continue
+        symbols = [name for name, _, _ in functions]
+        anchor_regions = [_region(rel_path, start_line, end_line) for _, start_line, end_line in functions]
+        total_lines = sum(line_spans)
+        start_line = min(start for _, start, _ in functions)
+        candidates.append(
+            Candidate(
+                id=f"py-duplicate-logic-{rel_path}-{start_line}-{len(functions)}",
+                kind="duplicate_logic",
+                title=f"Consolidate duplicate Python functions in {rel_path}",
+                description=(
+                    f"Functions {', '.join(f'`{name}`' for name in symbols)} in {rel_path} share the same"
+                    " structure and are candidates for consolidation"
+                ),
+                language="python",
+                scope="module",
+                source=["clone", "metric"],
+                files=[rel_path],
+                symbols=symbols,
+                anchorRegions=anchor_regions,
+                estimatedBenefit=_benefit(
+                    {
+                        "duplicationReduction": min(1.0, len(functions) / 3),
+                        "maintainabilityGain": 0.42,
+                    }
+                ),
+                estimatedRisk=_risk(
+                    {
+                        "semanticRisk": 0.28,
+                        "apiRisk": 0.12,
+                        "testRisk": 0.22,
+                        "conflictRisk": 0.18,
+                    }
+                ),
+                estimatedDiff=_diff(
+                    {
+                        "filesTouched": 1,
+                        "linesAdded": max(3, total_lines // 6),
+                        "linesModified": total_lines,
+                    }
+                ),
+                confidence=0.76,
+                applyModeHint="guarded",
+                requiredChecks=["parse", "lint", "typecheck", "unit_test"],
+                provenance=Provenance(
+                    detectors=["python-ast-duplicate-function"],
+                    evidence=[f"symbol:{name}" for name in symbols] + [f"duplicateGroupSize:{len(functions)}"],
+                ),
+            )
+        )
+    return candidates
 
 
 def _exported_names(tree: ast.AST) -> set[str]:
@@ -238,6 +312,7 @@ class PythonAdapter:
         is_package = path.name == "__init__.py"
         imports: set[str] = set()
         candidates: list[Candidate] = []
+        duplicate_functions: list[tuple[str, int, int, str]] = []
         top_level_statements = len(tree.body)
         if len(lines) >= LARGE_MODULE_THRESHOLD or top_level_statements >= TOP_LEVEL_STATEMENT_THRESHOLD:
             candidates.append(
@@ -284,8 +359,6 @@ class PythonAdapter:
                 )
             )
 
-
-
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module == "__future__":
                 continue
@@ -323,6 +396,7 @@ class PythonAdapter:
                 imports.update(_resolve_import_targets(current_module, is_package, node, known_modules))
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.end_lineno is not None:
                 length = node.end_lineno - node.lineno + 1
+                duplicate_functions.append((node.name, node.lineno, node.end_lineno, _duplicate_function_key(node)))
                 if length < LONG_FUNCTION_THRESHOLD:
                     continue
                 candidates.append(
@@ -408,4 +482,6 @@ class PythonAdapter:
                     ),
                 )
             )
+
+        candidates.extend(_build_duplicate_candidates(rel_path, duplicate_functions))
         return candidates, imports

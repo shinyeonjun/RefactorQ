@@ -291,3 +291,44 @@ def test_ts_worker_emits_reduce_cycle_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "reduce_cycle" and candidate["files"] == ["a.ts", "b.ts"] for candidate in payload["candidates"])
+
+def test_python_adapter_detects_duplicate_logic_candidate(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "def first(value):\n    normalized = value.strip()\n    return normalized.lower()\n\n"
+        "def second(value):\n    normalized = value.strip()\n    return normalized.lower()\n",
+        encoding="utf-8",
+    )
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    duplicate = next(candidate for candidate in candidates if candidate.kind == "duplicate_logic")
+    assert duplicate.files == ["sample.py"]
+    assert duplicate.symbols == ["first", "second"]
+    assert duplicate.apply_mode_hint == "guarded"
+
+
+def test_ts_worker_emits_duplicate_logic_candidates(tmp_path: Path) -> None:
+    (tmp_path / "dup.ts").write_text(
+        "function first(value: string) {\n  const normalized = value.trim();\n  return normalized.toLowerCase();\n}\n\n"
+        "function second(value: string) {\n  const normalized = value.trim();\n  return normalized.toLowerCase();\n}\n",
+        encoding="utf-8",
+    )
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    duplicate = next(candidate for candidate in payload["candidates"] if candidate["kind"] == "duplicate_logic")
+    assert duplicate["files"] == ["dup.ts"]
+    assert duplicate["symbols"] == ["first", "second"]
+    assert duplicate["applyModeHint"] == "guarded"

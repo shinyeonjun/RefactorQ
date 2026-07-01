@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import sys
+from typing import cast
 from pathlib import Path
 
 from pytest import MonkeyPatch
@@ -342,6 +344,73 @@ def test_verify_reports_boundary_contract_check_for_mixed_repo(tmp_path: Path) -
     assert boundary_check.kind == "build"
     assert "openapi.yaml" in boundary_check.evidence[0]
 
+
+def test_verify_runs_python_toolchain_commands(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "pkg.py"
+    sample.write_text("print('ok')\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_pkg.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    commands: list[list[str]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = cast(list[str], args[0])
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("refactorq.core.verification.service.subprocess.run", fake_run)
+
+    result = RefactorQService().verify(tmp_path)
+
+    assert result.status == "passed"
+    assert [check.name for check in result.checks[:4]] == [
+        "python_parse",
+        "python_lint",
+        "python_typecheck",
+        "python_unit_tests",
+    ]
+    assert [command[:3] for command in commands] == [
+        [sys.executable, "-m", "ruff"],
+        [sys.executable, "-m", "mypy"],
+        [sys.executable, "-m", "pytest"],
+    ]
+
+
+def test_verify_runs_typescript_package_scripts(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    (tmp_path / "sample.ts").write_text("console.log('ok');\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"ts:check":"tsc --noEmit","ts:build":"tsc"}}',
+        encoding="utf-8",
+    )
+
+    commands: list[list[str]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = cast(list[str], args[0])
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("refactorq.core.verification.service.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "refactorq.core.verification.service.TypeScriptAdapter.verify",
+        lambda self, root: [
+            VerificationCheckResult(
+                name="typescript_parse",
+                kind="parse",
+                status="passed",
+                evidence=["parsed 1 TypeScript/JavaScript files"],
+                details={},
+            )
+        ],
+    )
+
+    result = RefactorQService().verify(tmp_path)
+
+    assert result.status == "passed"
+    assert any(check.name == "typescript_typecheck" for check in result.checks)
+    assert any(check.name == "typescript_build" for check in result.checks)
+    assert commands == [["npm", "run", "ts:check"], ["npm", "run", "ts:build"]]
 
 def test_apply_command_emits_real_execution_payload(tmp_path: Path) -> None:
     sample = tmp_path / "sample.py"

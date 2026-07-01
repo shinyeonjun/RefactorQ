@@ -26,7 +26,7 @@ _OUTPUT_SCHEMA = {
     "required": ["status", "touchedFiles", "summary", "details"],
 }
 
-_SUPPORTED_KINDS = {"extract_function"}
+_SUPPORTED_KINDS = {"duplicate_logic", "extract_function"}
 _SUPPORTED_LANGUAGES = {"python", "typescript", "javascript"}
 
 
@@ -40,17 +40,27 @@ class CodexGuardedApplier:
         if not self.is_available():
             return "codex cli is not available"
         if candidate.kind not in _SUPPORTED_KINDS:
-            return "guarded Codex flow currently supports extract_function only"
+            return "guarded Codex flow currently supports extract_function and duplicate_logic only"
         if candidate.language not in _SUPPORTED_LANGUAGES:
             return "candidate language is not supported by guarded Codex flow"
-        if candidate.scope != "local":
-            return "guarded Codex flow currently supports local-scope candidates only"
-        if len(candidate.files) != 1 or len(candidate.anchor_regions) != 1 or len(candidate.symbols) != 1:
-            return "candidate does not target a single file, region, and symbol"
+        if len(candidate.files) != 1:
+            return "candidate does not target a single file"
         target = root / candidate.files[0]
         if not target.exists():
             return "candidate target file is missing"
-        return None
+        if candidate.kind == "extract_function":
+            if candidate.scope != "local":
+                return "guarded Codex flow currently supports local-scope extract_function candidates only"
+            if len(candidate.anchor_regions) != 1 or len(candidate.symbols) != 1:
+                return "extract_function candidate does not target a single region and symbol"
+            return None
+        if candidate.kind == "duplicate_logic":
+            if candidate.scope not in {"local", "module"}:
+                return "guarded Codex flow currently supports local or module duplicate_logic candidates only"
+            if len(candidate.anchor_regions) < 2 or len(candidate.symbols) < 2:
+                return "duplicate_logic candidate must target at least two regions and two symbols"
+            return None
+        return "candidate kind is not supported by guarded Codex flow"
 
     def apply(self, root: Path, candidate: Candidate) -> GuardedApplyResult:
         support_reason = self.support_reason(root, candidate)
@@ -101,8 +111,21 @@ class CodexGuardedApplier:
         return GuardedApplyResult.model_validate(payload)
 
     def _build_apply_prompt(self, candidate: Candidate) -> str:
-        region = candidate.anchor_regions[0]
         required_checks = ", ".join(candidate.required_checks) if candidate.required_checks else "none"
+        region_lines = [
+            f"- {region.file}: lines {region.start_line}-{region.end_line}"
+            for region in candidate.anchor_regions
+        ]
+        symbol_summary = ", ".join(candidate.symbols) if candidate.symbols else "none"
+        preferred_implementation = (
+            "extract a small private helper or equivalent local refactor so the target function becomes shorter"
+            " and clearer without changing behavior."
+        )
+        if candidate.kind == "duplicate_logic":
+            preferred_implementation = (
+                "consolidate the duplicate logic into a shared local helper or a single canonical implementation"
+                " while preserving every public or top-level call site behavior."
+            )
         return (
             "You are applying one guarded refactoring candidate inside an existing repository.\n"
             "Modify only the allowed file. Preserve behavior and public interfaces.\n"
@@ -112,14 +135,15 @@ class CodexGuardedApplier:
             f"Kind: {candidate.kind}\n"
             f"Language: {candidate.language}\n"
             f"File: {candidate.files[0]}\n"
-            f"Symbol: {candidate.symbols[0]}\n"
-            f"Region: lines {region.start_line}-{region.end_line}\n"
-            f"Title: {candidate.title}\n"
-            f"Description: {candidate.description}\n"
-            f"Required checks: {required_checks}\n\n"
-            "Preferred implementation: extract a small private helper or equivalent local refactor so the"
-            " target function becomes shorter and clearer without changing behavior.\n\n"
-            "Return JSON matching the provided schema with touchedFiles, summary, and details.\n"
+            f"Symbols: {symbol_summary}\n"
+            "Candidate regions:\n"
+            + "\n".join(region_lines)
+            + "\n"
+            + f"Title: {candidate.title}\n"
+            + f"Description: {candidate.description}\n"
+            + f"Required checks: {required_checks}\n\n"
+            + f"Preferred implementation: {preferred_implementation}\n\n"
+            + "Return JSON matching the provided schema with touchedFiles, summary, and details.\n"
         )
 
     def _build_repair_prompt(self, candidates: list[Candidate], verification: VerificationResult) -> str:
