@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refactorq"
+version = "0.1.0"
+description = "Refactoring orchestrator for Python and TypeScript repositories"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.8,<3",
+  "typer>=0.12,<1",
+  "rich>=13.7,<14",
+  "orjson>=3.10,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+  "ruff>=0.5,<1",
+  "mypy>=1.10,<2",
+]
+
+[project.scripts]
+refactorq = "refactorq.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["refactorq*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true

@@ -1,0 +1,11 @@
+{
+  "name": "refactorq-workspace",
+  "private": true,
+  "workspaces": [
+    "workers/ts-adapter"
+  ],
+  "scripts": {
+    "ts:build": "npm --workspace workers/ts-adapter run build",
+    "ts:check": "npm --workspace workers/ts-adapter run check"
+  }
+}
