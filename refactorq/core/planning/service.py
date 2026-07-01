@@ -42,6 +42,9 @@ def _is_boundary_changing(candidate: Candidate) -> bool:
     return candidate.boundary_impact.impact_level == "high"
 
 
+def _is_cross_language(candidate: Candidate) -> bool:
+    return candidate.boundary_impact.cross_language
+
 def _is_unsupported_worker_guess(candidate: Candidate) -> bool:
     if candidate.language != "typescript":
         return False
@@ -51,6 +54,8 @@ def _is_unsupported_worker_guess(candidate: Candidate) -> bool:
 def _safe_filter(candidate: Candidate) -> str | None:
     if candidate.apply_mode_hint != "auto":
         return "requires guarded or report-only handling"
+    if _is_cross_language(candidate):
+        return "cross-language boundary candidates are excluded in safe mode"
     if candidate.boundary_impact.impact_level not in {"none", "low"}:
         return "boundary-changing candidates are excluded in safe mode"
     if not _has_required_checks(candidate):
@@ -61,6 +66,8 @@ def _safe_filter(candidate: Candidate) -> str | None:
 def _balanced_filter(candidate: Candidate) -> str | None:
     if candidate.apply_mode_hint == "report_only":
         return "report-only candidate retained as explanatory exclusion"
+    if _is_cross_language(candidate):
+        return "cross-language candidate retained as report until boundary-aware execution lands"
     if _is_boundary_changing(candidate):
         return "boundary-changing candidate requires stronger verification than balanced mode baseline"
     if _is_unsupported_worker_guess(candidate):

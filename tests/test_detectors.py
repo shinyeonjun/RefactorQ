@@ -28,6 +28,15 @@ def test_python_adapter_detects_private_dead_code(tmp_path: Path) -> None:
     assert any(candidate.kind == "dead_code" and candidate.symbols == ["_helper"] for candidate in candidates)
 
 
+def test_python_adapter_detects_large_module_candidate(tmp_path: Path) -> None:
+    sample = tmp_path / "large_module.py"
+    sample.write_text("\n".join([f"value_{index} = {index}" for index in range(20)]), encoding="utf-8")
+
+    candidates = PythonAdapter().scan(tmp_path)
+
+    assert any(candidate.kind == "split_large_module" and candidate.files == ["large_module.py"] for candidate in candidates)
+
+
 
 def test_typescript_adapter_preserves_worker_candidate_order(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     sample = tmp_path / "sample.ts"
@@ -232,3 +241,22 @@ def test_ts_worker_emits_unused_symbol_candidates(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
 
     assert any(candidate["kind"] == "unused_symbol" and candidate["symbols"] == ["helper"] for candidate in payload["candidates"])
+
+def test_ts_worker_emits_large_module_candidates(tmp_path: Path) -> None:
+    statements = [f"const value{index} = {index};" for index in range(20)]
+    (tmp_path / "large.ts").write_text("\n".join(statements) + "\n", encoding="utf-8")
+
+    worker = Path(__file__).resolve().parents[1] / "workers" / "ts-adapter" / "src" / "index.ts"
+    request = json.dumps({"protocolVersion": PROTOCOL_VERSION, "capabilities": ["scan"], "command": "scan", "root": str(tmp_path)})
+    completed = subprocess.run(
+        ["node", "--experimental-strip-types", str(worker)],
+        input=request,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+
+    assert any(candidate["kind"] == "split_large_module" and candidate["files"] == ["large.ts"] for candidate in payload["candidates"])

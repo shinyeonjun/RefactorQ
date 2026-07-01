@@ -8,6 +8,7 @@ from refactorq.adapters.registry import detect_adapters
 from refactorq.core.candidate import Candidate
 from refactorq.core.execution import ApplyResult, ReportResult, RunResult, apply_plan, report_plan, run_plan
 from refactorq.core.planning import PlanMode, PlanResult, build_plan
+from refactorq.core.boundary import enrich_boundary_candidates
 from refactorq.core.repo import RepoSnapshot, detect_repo
 from refactorq.core.repo_source import normalize_repo_source
 from refactorq.core.verification import VerificationResult
@@ -35,6 +36,7 @@ class RefactorQService:
         candidates: list[Candidate] = []
         for adapter in adapters:
             candidates.extend(adapter.scan(root))
+        candidates = enrich_boundary_candidates(snapshot, candidates)
         return ScanResult(
             repo=snapshot,
             adapterNames=[adapter.name for adapter in adapters],

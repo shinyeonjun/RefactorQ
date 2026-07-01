@@ -14,6 +14,8 @@ from refactorq.core.candidate.models import (
 from refactorq.core.filesystem import walk_source_files
 
 LONG_FUNCTION_THRESHOLD = 35
+LARGE_MODULE_THRESHOLD = 300
+TOP_LEVEL_STATEMENT_THRESHOLD = 18
 
 
 def _region(file: str, start_line: int, end_line: int) -> AnchorRegion:
@@ -80,6 +82,51 @@ class PythonAdapter:
         referenced_names = _referenced_names(tree)
         exported_names = _exported_names(tree)
         candidates: list[Candidate] = []
+        top_level_statements = len(tree.body)
+        if len(lines) >= LARGE_MODULE_THRESHOLD or top_level_statements >= TOP_LEVEL_STATEMENT_THRESHOLD:
+            candidates.append(
+                Candidate(
+                    id=f"py-split-large-module-{rel_path}",
+                    kind="split_large_module",
+                    title=f"Split large module {rel_path}",
+                    description=(
+                        f"Module `{rel_path}` spans {len(lines)} lines across {top_level_statements} top-level"
+                        " statements and should be reviewed for decomposition"
+                    ),
+                    language="python",
+                    scope="module",
+                    source=["metric"],
+                    files=[rel_path],
+                    estimatedBenefit=_benefit(
+                        {
+                            "complexityReduction": min(1.0, len(lines) / LARGE_MODULE_THRESHOLD),
+                            "maintainabilityGain": 0.4,
+                        }
+                    ),
+                    estimatedRisk=_risk(
+                        {
+                            "semanticRisk": 0.45,
+                            "apiRisk": 0.25,
+                            "testRisk": 0.3,
+                            "conflictRisk": 0.2,
+                        }
+                    ),
+                    estimatedDiff=_diff(
+                        {
+                            "filesTouched": 1,
+                            "linesAdded": max(8, len(lines) // 5),
+                            "linesModified": len(lines),
+                        }
+                    ),
+                    confidence=0.7,
+                    applyModeHint="report_only",
+                    requiredChecks=["parse", "lint", "typecheck", "unit_test"],
+                    provenance=Provenance(
+                        detectors=["python-ast-large-module"],
+                        evidence=[f"line_span:{len(lines)}", f"top_level_statements:{top_level_statements}"],
+                    ),
+                )
+            )
 
 
 

@@ -40,6 +40,7 @@ def _candidate(
     language: str = "python",
     impact_level: str = "none",
     required_checks: list[str] | None = None,
+    cross_language: bool = False,
     provenance_detectors: list[str] | None = None,
     dependencies: list[str] | None = None,
 ) -> Candidate:
@@ -72,6 +73,7 @@ def _candidate(
             },
             "contextSignals": {},
             "boundaryImpact": {
+                "crossLanguage": cross_language,
                 "impactLevel": impact_level,
             },
             "confidence": confidence,
@@ -89,6 +91,7 @@ def test_safe_mode_filters_to_low_risk_auto_candidates() -> None:
         _candidate("safe-auto"),
         _candidate("guarded", apply_mode_hint="guarded"),
         _candidate("boundary-high", impact_level="high"),
+        _candidate("cross-language", cross_language=True, impact_level="low", files=["backend/api.py"]),
         _candidate("missing-checks", required_checks=[]),
     ]
 
@@ -103,6 +106,7 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
     candidates = [
         _candidate("auto-ok"),
         _candidate("guarded-ok", apply_mode_hint="guarded"),
+        _candidate("cross-language", cross_language=True, impact_level="low", files=["frontend/client.ts"]),
         _candidate("report-only", apply_mode_hint="report_only"),
         _candidate(
             "bridge-guess",
@@ -115,12 +119,15 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
 
     assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "guarded-ok"]
     excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
+    assert (
+        excluded["cross-language"]
+        == "cross-language candidate retained as report until boundary-aware execution lands"
+    )
     assert excluded["report-only"] == "report-only candidate retained as explanatory exclusion"
     assert (
         excluded["bridge-guess"]
         == "unsupported TypeScript bridge guess excluded until worker-backed semantics are available"
     )
-
 
 def test_report_mode_preserves_deterministic_ranking_order() -> None:
     candidates = [

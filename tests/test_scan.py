@@ -163,3 +163,28 @@ def test_deferred_cleanup_runs_on_next_normalization(tmp_path: Path, monkeypatch
 
     assert not stale_temp.exists()
     assert not deferred_record.exists()
+
+def test_service_scan_enriches_boundary_candidates_for_mixed_repo(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\n", encoding="utf-8")
+    (backend / "api.py").write_text("import os\n\nprint('ok')\n", encoding="utf-8")
+    (frontend / "client.ts").write_text("function helper() {\n  return 1;\n}\n\nconsole.log('ok');\n", encoding="utf-8")
+
+    result = RefactorQService().scan(tmp_path)
+
+    boundary_review = next(
+        candidate for candidate in result.candidates if candidate.id.startswith("boundary-review-openapi-yaml")
+    )
+    assert boundary_review.apply_mode_hint == "report_only"
+    assert boundary_review.boundary_impact.cross_language is True
+    assert "openapi" in boundary_review.boundary_impact.boundary_types
+    assert boundary_review.files == ["openapi.yaml"]
+
+    enriched_python = next(candidate for candidate in result.candidates if candidate.id.startswith("py-unused-import-backend/api.py"))
+    assert enriched_python.boundary_impact.cross_language is True
+    assert "http_api" in enriched_python.boundary_impact.boundary_types
+    assert "openapi.yaml" in enriched_python.boundary_impact.contract_artifacts
+    assert "backend/api.py" in enriched_python.boundary_impact.producer_side

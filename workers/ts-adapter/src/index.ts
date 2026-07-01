@@ -5,6 +5,8 @@ import ts from "typescript";
 const PROTOCOL_VERSION = 1;
 const PROTOCOL_CAPABILITIES = ["scan", "verify", "deterministic-ordering", "typescript-semantic-candidates"];
 const LONG_FUNCTION_THRESHOLD = 40;
+const LARGE_MODULE_THRESHOLD = 300;
+const TOP_LEVEL_STATEMENT_THRESHOLD = 18;
 const IGNORED = new Set([
   ".git",
   ".venv",
@@ -93,7 +95,7 @@ type WorkerResponse = WorkerFailure | WorkerScanSuccess | WorkerVerifySuccess;
 
 type CandidatePayload = {
   id: string;
-  kind: "unused_import" | "unused_symbol" | "extract_function";
+  kind: "unused_import" | "unused_symbol" | "extract_function" | "split_large_module";
 
   title: string;
   description: string;
@@ -136,7 +138,7 @@ type CandidatePayload = {
     impactLevel: "none" | "low" | "medium" | "high";
   };
   confidence: number;
-  applyModeHint: "auto" | "guarded";
+  applyModeHint: "auto" | "guarded" | "report_only";
   requiredChecks: Array<"parse" | "lint" | "typecheck" | "unit_test">;
   dependencies: string[];
   conflicts: string[];
@@ -376,6 +378,49 @@ function buildLongFunctionCandidates(sourceFile: ts.SourceFile, root: string): C
   return candidates;
 }
 
+function buildLargeModuleCandidates(sourceFile: ts.SourceFile, root: string): CandidatePayload[] {
+  const relPath = relativePosix(root, sourceFile.fileName);
+  const totalLines = sourceFile.getLineAndCharacterOfPosition(sourceFile.end).line + 1;
+  const topLevelStatements = sourceFile.statements.length;
+  if (totalLines < LARGE_MODULE_THRESHOLD && topLevelStatements < TOP_LEVEL_STATEMENT_THRESHOLD) {
+    return [];
+  }
+
+  return [{
+    id: `ts-split-large-module-${relPath}`,
+    kind: "split_large_module",
+    title: `Split large module ${relPath}`,
+    description: `Module \`${relPath}\` spans ${totalLines} lines across ${topLevelStatements} top-level statements and should be reviewed for decomposition`,
+    language: "typescript",
+    scope: "module",
+    source: ["metric"],
+    files: [relPath],
+    symbols: [],
+    anchorRegions: [],
+    estimatedBenefit: {
+      complexityReduction: Math.min(1, totalLines / LARGE_MODULE_THRESHOLD),
+      maintainabilityGain: 0.4,
+    },
+    estimatedRisk: { semanticRisk: 0.45, testRisk: 0.3, conflictRisk: 0.2 },
+    estimatedDiff: {
+      filesTouched: 1,
+      linesAdded: Math.max(8, Math.floor(totalLines / 5)),
+      linesModified: totalLines,
+    },
+    contextSignals: createEmptyContextSignals(),
+    boundaryImpact: createEmptyBoundaryImpact(),
+    confidence: 0.7,
+    applyModeHint: "report_only",
+    requiredChecks: ["parse", "lint", "typecheck", "unit_test"],
+    dependencies: [],
+    conflicts: [],
+    provenance: {
+      detectors: ["ts-worker-large-module"],
+      evidence: [`line_span:${totalLines}`, `top_level_statements:${topLevelStatements}`],
+    },
+  }];
+}
+
 function buildUnusedSymbolCandidates(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
@@ -490,6 +535,7 @@ function scan(rootArg: string): WorkerScanSuccess {
     candidates.push(...buildUnusedImportCandidates(checker, sourceFile, root));
     candidates.push(...buildUnusedSymbolCandidates(checker, sourceFile, root));
     candidates.push(...buildLongFunctionCandidates(sourceFile, root));
+    candidates.push(...buildLargeModuleCandidates(sourceFile, root));
   }
 
   return {
