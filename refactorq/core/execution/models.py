@@ -56,11 +56,20 @@ class ExecutionSupportSummary(BaseModel):
     git_reason: str | None = Field(default=None, alias="gitReason")
 
 
+class BoundaryExecutionSummary(BaseModel):
+    cross_language_candidates: int = Field(alias="crossLanguageCandidates")
+    boundary_sensitive_candidates: int = Field(alias="boundarySensitiveCandidates")
+    blocked_boundary_candidates: int = Field(alias="blockedBoundaryCandidates")
+    contract_artifacts: list[str] = Field(default_factory=list, alias="contractArtifacts")
+    highest_impact: str = Field(default="none", alias="highestImpact")
+
+
 class ReportResult(BaseModel):
     mode: PlanMode
     repo: RepoSnapshot
     plan: PlanResult
     execution_support: ExecutionSupportSummary = Field(alias="executionSupport")
+    boundary_execution: BoundaryExecutionSummary = Field(alias="boundaryExecution")
 
 
 class RunResult(BaseModel):

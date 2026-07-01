@@ -308,6 +308,40 @@ def test_report_summarizes_supported_execution_candidates(tmp_path: Path) -> Non
     assert result.execution_support.git_branching_supported is False
 
 
+def test_report_surfaces_boundary_execution_summary(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\n", encoding="utf-8")
+    (backend / "api.py").write_text("import os\n\nprint('ok')\n", encoding="utf-8")
+    (frontend / "client.ts").write_text("function helper() {\n  return 1;\n}\n\nconsole.log('ok');\n", encoding="utf-8")
+
+    result = RefactorQService().report(tmp_path, "report")
+
+    assert result.boundary_execution.cross_language_candidates >= 1
+    assert result.boundary_execution.boundary_sensitive_candidates >= 1
+    assert result.boundary_execution.blocked_boundary_candidates >= 1
+    assert result.boundary_execution.contract_artifacts == ["openapi.yaml"]
+    assert result.boundary_execution.highest_impact in {"medium", "high"}
+
+
+def test_verify_reports_boundary_contract_check_for_mixed_repo(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\n", encoding="utf-8")
+    (backend / "api.py").write_text("print('ok')\n", encoding="utf-8")
+    (frontend / "client.ts").write_text("console.log('ok');\n", encoding="utf-8")
+
+    result = RefactorQService().verify(tmp_path)
+
+    boundary_check = next(check for check in result.checks if check.name == "boundary_contracts")
+    assert boundary_check.status == "passed"
+    assert boundary_check.kind == "build"
+    assert "openapi.yaml" in boundary_check.evidence[0]
+
 
 def test_apply_command_emits_real_execution_payload(tmp_path: Path) -> None:
     sample = tmp_path / "sample.py"

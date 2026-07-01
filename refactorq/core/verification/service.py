@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from refactorq.core.repo import detect_repo
 from refactorq.adapters.typescript import TypeScriptAdapter
 from refactorq.core.filesystem import walk_source_files
 
@@ -29,6 +30,33 @@ def _verify_python_parse(root: Path) -> VerificationCheckResult:
     )
 
 
+
+def _verify_boundary_contracts(root: Path) -> VerificationCheckResult:
+    repo = detect_repo(root)
+    if not repo.mixed_language:
+        return VerificationCheckResult(
+            name="boundary_contracts",
+            kind="build",
+            status="skipped",
+            evidence=["single-language repository; no cross-language boundary contract check required"],
+            details={"mixedLanguage": False, "artifactCount": len(repo.boundary_artifacts)},
+        )
+    if repo.boundary_artifacts:
+        return VerificationCheckResult(
+            name="boundary_contracts",
+            kind="build",
+            status="passed",
+            evidence=[f"detected boundary artifacts: {', '.join(repo.boundary_artifacts)}"],
+            details={"mixedLanguage": True, "artifactCount": len(repo.boundary_artifacts)},
+        )
+    return VerificationCheckResult(
+        name="boundary_contracts",
+        kind="build",
+        status="skipped",
+        evidence=["mixed-language repository detected but no explicit boundary contract artifacts were found"],
+        details={"mixedLanguage": True, "artifactCount": 0},
+    )
+
 def verify_repo(root: Path) -> VerificationResult:
     checks: list[VerificationCheckResult] = []
 
@@ -40,7 +68,9 @@ def verify_repo(root: Path) -> VerificationResult:
     if ts_adapter.supports(root):
         checks.extend(ts_adapter.verify(root))
 
-    if not checks:
+    checks.append(_verify_boundary_contracts(root))
+
+    if len(checks) == 1 and checks[0].name == "boundary_contracts":
         checks.append(
             VerificationCheckResult(
                 name="no_supported_checks",

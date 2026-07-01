@@ -25,6 +25,7 @@ from .models import (
     ApplyResult,
     ExecutionCandidateNote,
     ExecutionSupportSummary,
+    BoundaryExecutionSummary,
     GitExecutionResult,
     RepairResult,
     ReportResult,
@@ -457,10 +458,22 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
     supported_auto = 0
     supported_guarded = 0
     unsupported = 0
+    blocked_boundary = 0
+    cross_language = 0
+    boundary_sensitive = 0
+    highest_impact = "none"
     kinds: set[str] = set()
     guarded_applier = CodexGuardedApplier()
     git_state = inspect_git_workspace(root)
+    impact_priority = {"none": 0, "low": 1, "medium": 2, "high": 3}
     for candidate in plan.selected_candidates:
+        if candidate.boundary_impact.cross_language:
+            cross_language += 1
+        if candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none":
+            boundary_sensitive += 1
+        if impact_priority[candidate.boundary_impact.impact_level] > impact_priority[highest_impact]:
+            highest_impact = candidate.boundary_impact.impact_level
+
         if _supports_candidate(root, candidate, guarded_applier):
             supported += 1
             kinds.add(candidate.kind)
@@ -470,6 +483,8 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
                 supported_guarded += 1
         else:
             unsupported += 1
+            if candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none":
+                blocked_boundary += 1
     return ReportResult(
         mode=plan.mode,
         repo=plan.repo,
@@ -482,6 +497,13 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
             appliedCandidateKinds=sorted(kinds),
             gitBranchingSupported=git_state.available and git_state.clean,
             gitReason=git_state.reason,
+        ),
+        boundaryExecution=BoundaryExecutionSummary(
+            crossLanguageCandidates=cross_language,
+            boundarySensitiveCandidates=boundary_sensitive,
+            blockedBoundaryCandidates=blocked_boundary,
+            contractArtifacts=plan.repo.boundary_artifacts,
+            highestImpact=highest_impact,
         ),
     )
 
