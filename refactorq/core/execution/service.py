@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from pathlib import Path
 
+from pydantic import ValidationError
+
+from refactorq.agents.codex import CodexGuardedApplier
 from refactorq.core.candidate import Candidate
+from refactorq.core.filesystem import walk_repo_files
 from refactorq.core.planning import PlanResult
 from refactorq.core.verification import VerificationResult
 from refactorq.core.verification.service import verify_repo
@@ -17,7 +23,7 @@ _TS_IMPORT_PATTERN = re.compile(
 
 
 class _ApplyInternalResult(ApplyResult):
-    backups: dict[str, str] = {}
+    original_snapshot: dict[str, bytes] = {}
 
 
 def _candidate_line_number(candidate: Candidate) -> int:
@@ -26,9 +32,10 @@ def _candidate_line_number(candidate: Candidate) -> int:
     return candidate.anchor_regions[0].start_line
 
 
-def _candidate_sort_key(candidate: Candidate) -> tuple[str, int, str]:
+def _candidate_sort_key(candidate: Candidate) -> tuple[int, str, int, str]:
+    apply_priority = 0 if candidate.apply_mode_hint == "auto" else 1
     file_name = candidate.files[0] if candidate.files else ""
-    return (file_name, -_candidate_line_number(candidate), candidate.id)
+    return (apply_priority, file_name, -_candidate_line_number(candidate), candidate.id)
 
 
 def _looks_like_single_line_import(line: str) -> bool:
@@ -138,7 +145,7 @@ def _rewrite_unused_import_line(candidate: Candidate, line: str) -> str | None:
     return None
 
 
-def _support_reason(root: Path, candidate: Candidate) -> str | None:
+def _auto_support_reason(root: Path, candidate: Candidate) -> str | None:
     if candidate.apply_mode_hint != "auto":
         return "candidate requires guarded handling"
     if candidate.kind != "unused_import":
@@ -162,7 +169,7 @@ def _support_reason(root: Path, candidate: Candidate) -> str | None:
     return None
 
 
-def _apply_candidate(lines: list[str], candidate: Candidate) -> tuple[list[str], bool]:
+def _apply_auto_candidate(lines: list[str], candidate: Candidate) -> tuple[list[str], bool]:
     region = candidate.anchor_regions[0]
     index = region.start_line - 1
     if index < 0 or index >= len(lines):
@@ -178,39 +185,135 @@ def _apply_candidate(lines: list[str], candidate: Candidate) -> tuple[list[str],
     return updated, updated != lines
 
 
+def _snapshot_repo(root: Path) -> dict[str, bytes]:
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in walk_repo_files(root)}
+
+
+def _changed_paths(before: dict[str, bytes], after: dict[str, bytes]) -> list[str]:
+    changed: list[str] = []
+    for rel_path in sorted(set(before) | set(after)):
+        if before.get(rel_path) != after.get(rel_path):
+            changed.append(rel_path)
+    return changed
+
+
+def _restore_snapshot(root: Path, snapshot: dict[str, bytes]) -> bool:
+    current = _snapshot_repo(root)
+    restored = False
+    for rel_path in sorted(set(snapshot) | set(current)):
+        target = root / rel_path
+        original = snapshot.get(rel_path)
+        current_bytes = current.get(rel_path)
+        if original == current_bytes:
+            continue
+        if original is None:
+            if target.exists():
+                target.unlink()
+                restored = True
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(original)
+        restored = True
+    return restored
+
+
+def _guarded_failure_reason(error: Exception) -> str:
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "Codex guarded execution timed out"
+    if isinstance(error, subprocess.CalledProcessError):
+        stderr = error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr
+        stdout = error.stdout.decode("utf-8", errors="replace") if isinstance(error.stdout, bytes) else error.stdout
+        detail = (stderr or stdout or "")[:200].strip()
+        return f"Codex guarded execution failed{': ' + detail if detail else ''}"
+    if isinstance(error, FileNotFoundError):
+        return "codex cli is not available"
+    if isinstance(error, json.JSONDecodeError):
+        return "Codex guarded execution returned malformed JSON"
+    if isinstance(error, ValidationError):
+        return "Codex guarded execution returned an invalid structured response"
+    return f"Codex guarded execution failed: {error}"
+
+
+def _apply_guarded_candidate(
+    root: Path,
+    candidate: Candidate,
+    guarded_applier: CodexGuardedApplier,
+) -> tuple[bool, str | None]:
+    support_reason = guarded_applier.support_reason(root, candidate)
+    if support_reason is not None:
+        return False, support_reason
+
+    before = _snapshot_repo(root)
+    try:
+        result = guarded_applier.apply(root, candidate)
+    except Exception as exc:  # pragma: no cover - exercised through failure handling tests
+        _restore_snapshot(root, before)
+        return False, _guarded_failure_reason(exc)
+
+    after = _snapshot_repo(root)
+    changed_paths = _changed_paths(before, after)
+    allowed_files = set(candidate.files)
+    touched_files = set(result.touched_files)
+
+    if result.status == "unsupported":
+        _restore_snapshot(root, before)
+        reason = result.summary[0] if result.summary else "guarded Codex flow reported unsupported"
+        return False, reason
+    if result.status == "no_change" and not changed_paths:
+        reason = result.summary[0] if result.summary else "guarded Codex flow reported no changes"
+        return False, reason
+    if any(path not in allowed_files for path in changed_paths):
+        _restore_snapshot(root, before)
+        return False, "guarded Codex flow touched files outside the allowed candidate scope"
+    if any(path not in allowed_files for path in touched_files):
+        _restore_snapshot(root, before)
+        return False, "guarded Codex response declared files outside the allowed candidate scope"
+    if not changed_paths:
+        return False, "guarded Codex flow produced no file changes"
+    return True, None
+
+
 def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
     applied: list[Candidate] = []
     skipped: list[ExecutionCandidateNote] = []
     file_lines: dict[str, list[str]] = {}
-    backups: dict[str, str] = {}
+    original_snapshot = _snapshot_repo(root)
+    guarded_applier = CodexGuardedApplier()
 
     for candidate in sorted(plan.selected_candidates, key=_candidate_sort_key):
-        reason = _support_reason(root, candidate)
-        if reason is not None:
-            skipped.append(ExecutionCandidateNote(candidate=candidate, reason=reason))
+        if candidate.apply_mode_hint == "auto":
+            reason = _auto_support_reason(root, candidate)
+            if reason is not None:
+                skipped.append(ExecutionCandidateNote(candidate=candidate, reason=reason))
+                continue
+            rel_path = candidate.files[0]
+            if rel_path not in file_lines:
+                current_text = (root / rel_path).read_text(encoding="utf-8")
+                file_lines[rel_path] = current_text.splitlines(keepends=True)
+            updated_lines, changed = _apply_auto_candidate(file_lines[rel_path], candidate)
+            if not changed:
+                skipped.append(
+                    ExecutionCandidateNote(candidate=candidate, reason="candidate produced no deterministic file change")
+                )
+                continue
+            file_lines[rel_path] = updated_lines
+            (root / rel_path).write_text("".join(updated_lines), encoding="utf-8")
+            applied.append(candidate)
             continue
-        rel_path = candidate.files[0]
-        if rel_path not in backups:
-            original_text = (root / rel_path).read_text(encoding="utf-8")
-            backups[rel_path] = original_text
-            file_lines[rel_path] = original_text.splitlines(keepends=True)
-        updated_lines, changed = _apply_candidate(file_lines[rel_path], candidate)
-        if not changed:
-            skipped.append(
-                ExecutionCandidateNote(candidate=candidate, reason="candidate produced no deterministic file change")
-            )
-            continue
-        file_lines[rel_path] = updated_lines
-        applied.append(candidate)
 
-    changed_files: list[str] = []
-    for rel_path, original_text in backups.items():
-        updated_text = "".join(file_lines[rel_path])
-        if updated_text == original_text:
+        if candidate.apply_mode_hint == "guarded":
+            applied_guarded, reason = _apply_guarded_candidate(root, candidate, guarded_applier)
+            if not applied_guarded:
+                skipped.append(
+                    ExecutionCandidateNote(candidate=candidate, reason=reason or "guarded Codex flow skipped candidate")
+                )
+                continue
+            applied.append(candidate)
             continue
-        (root / rel_path).write_text(updated_text, encoding="utf-8")
-        changed_files.append(rel_path)
 
+        skipped.append(ExecutionCandidateNote(candidate=candidate, reason="report-only candidate is not applied"))
+
+    changed_files = _changed_paths(original_snapshot, _snapshot_repo(root))
     return _ApplyInternalResult(
         mode=plan.mode,
         repo=plan.repo,
@@ -218,20 +321,9 @@ def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
         status="applied" if changed_files else "no_changes",
         appliedCandidates=applied,
         skippedCandidates=skipped,
-        changedFiles=sorted(changed_files),
-        backups=backups,
+        changedFiles=changed_files,
+        original_snapshot=original_snapshot,
     )
-
-
-def _restore_backups(root: Path, backups: dict[str, str]) -> bool:
-    restored = False
-    for rel_path, original_text in backups.items():
-        target = root / rel_path
-        if target.read_text(encoding="utf-8") == original_text:
-            continue
-        target.write_text(original_text, encoding="utf-8")
-        restored = True
-    return restored
 
 
 def apply_plan(root: Path, plan: PlanResult) -> ApplyResult:
@@ -239,12 +331,21 @@ def apply_plan(root: Path, plan: PlanResult) -> ApplyResult:
     return ApplyResult.model_validate(result.model_dump(by_alias=True))
 
 
+def _supports_candidate(root: Path, candidate: Candidate, guarded_applier: CodexGuardedApplier) -> bool:
+    if candidate.apply_mode_hint == "auto":
+        return _auto_support_reason(root, candidate) is None
+    if candidate.apply_mode_hint == "guarded":
+        return guarded_applier.support_reason(root, candidate) is None
+    return False
+
+
 def report_plan(root: Path, plan: PlanResult) -> ReportResult:
     supported = 0
     unsupported = 0
     kinds: set[str] = set()
+    guarded_applier = CodexGuardedApplier()
     for candidate in plan.selected_candidates:
-        if _support_reason(root, candidate) is None:
+        if _supports_candidate(root, candidate, guarded_applier):
             supported += 1
             kinds.add(candidate.kind)
         else:
@@ -279,7 +380,7 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
 
     verification = verify_repo(root)
     if verification.status == "failed":
-        rollback_applied = _restore_backups(root, apply_result.backups)
+        rollback_applied = _restore_snapshot(root, apply_result.original_snapshot)
         return RunResult(
             mode=plan.mode,
             repo=plan.repo,
