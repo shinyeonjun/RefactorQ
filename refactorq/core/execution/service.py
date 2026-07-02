@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from typing import cast
 
 from pydantic import ValidationError
 
@@ -33,8 +34,10 @@ from .models import (
     RepairResult,
     ReportResult,
     RunResult,
+    RunStatus,
     VerificationPlanSummary,
 )
+
 
 _IMPORT_PREFIXES = ("import ", "from ")
 _TS_IMPORT_PATTERN = re.compile(
@@ -240,20 +243,14 @@ def _candidate_support_reason(root: Path, candidate: Candidate, guarded_applier:
 
 
 def _verify_for_execution(root: Path, plan: PlanResult, candidates: list[Candidate]) -> VerificationResult:
-    boundary_candidates = [
-        candidate
-        for candidate in candidates
-        if candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none"
-    ]
-    if not boundary_candidates:
-        return verify_repo(root)
-
     required_checks: list[VerificationCheck] = []
-    for candidate in boundary_candidates:
+    for candidate in candidates:
         for check in candidate.required_checks:
-            if check in {"build", "integration_test"} and check not in required_checks:
+            if check not in required_checks:
                 required_checks.append(check)
-    return verify_repo(root, required_checks=required_checks, candidates=boundary_candidates)
+    if not required_checks:
+        required_checks = cast(list[VerificationCheck], list(plan.required_checks))
+    return verify_repo(root, required_checks=required_checks, candidates=candidates)
 
 
 def _delete_region(lines: list[str], start_line: int, end_line: int) -> list[str]:
@@ -589,6 +586,24 @@ def _apply_plan_internal(root: Path, plan: PlanResult) -> _ApplyInternalResult:
     file_lines: dict[str, list[str]] = {}
     original_snapshot = _snapshot_repo(root)
     guarded_applier = CodexGuardedApplier()
+    if plan.selection_source == "optimizer_rejected_no_batch" and not plan.selected_candidates:
+        proposed_candidates = {candidate.id: candidate for candidate in (plan.solver_proposal.candidates if plan.solver_proposal else [])}
+        rejection_reason = "; ".join(plan.proposal_revalidation.rejection_reasons) or "planner revalidation rejected the optimizer proposal"
+        skipped = [
+            ExecutionCandidateNote(candidate=candidate, reason=rejection_reason)
+            for candidate_id, candidate in proposed_candidates.items()
+            if candidate_id in set(plan.solver_proposal.selected_candidate_ids if plan.solver_proposal else [])
+        ]
+        return _ApplyInternalResult(
+            mode=plan.mode,
+            repo=plan.repo,
+            plan=plan,
+            status="rejected_no_batch",
+            appliedCandidates=[],
+            skippedCandidates=skipped,
+            changedFiles=[],
+            original_snapshot=original_snapshot,
+        )
     changed_files_since_scan: set[str] = set()
     for candidate in sorted(plan.selected_candidates, key=_candidate_sort_key):
         reason = _candidate_support_reason(root, candidate, guarded_applier)
@@ -654,6 +669,17 @@ def apply_plan(root: Path, plan: PlanResult) -> ApplyResult:
     return ApplyResult.model_validate(result.model_dump(by_alias=True))
 
 
+def _report_scope_candidates(plan: PlanResult) -> list[Candidate]:
+    if plan.selection_source != "optimizer_rejected_no_batch" or plan.solver_proposal is None:
+        return list(plan.selected_candidates)
+    proposed_by_id = {candidate.id: candidate for candidate in plan.solver_proposal.candidates}
+    return [
+        proposed_by_id[candidate_id]
+        for candidate_id in plan.solver_proposal.selected_candidate_ids
+        if candidate_id in proposed_by_id
+    ]
+
+
 def report_plan(root: Path, plan: PlanResult) -> ReportResult:
     supported = 0
     supported_auto = 0
@@ -671,11 +697,17 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
     guarded_applier = CodexGuardedApplier()
     git_state = inspect_git_workspace(root)
     impact_priority = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    report_candidates = _report_scope_candidates(plan)
+    report_required_checks: list[VerificationCheck] = []
+    for candidate in report_candidates:
+        for check in candidate.required_checks:
+            if check not in report_required_checks:
+                report_required_checks.append(check)
     verification_plan = VerificationPlanSummary.model_validate(
         build_verification_report(
             root,
-            required_checks=plan.required_checks,
-            candidates=plan.selected_candidates,
+            required_checks=report_required_checks,
+            candidates=report_candidates,
         )
     )
     boundary_candidates_by_id = {
@@ -688,7 +720,7 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
             for artifact in candidate_payload.contract_artifacts
         }
     )
-    for candidate in plan.selected_candidates:
+    for candidate in report_candidates:
         boundary_candidate = boundary_candidates_by_id.get(candidate.id)
         boundary_sensitive_candidate = (
             candidate.boundary_impact.cross_language or candidate.boundary_impact.impact_level != "none"
@@ -725,6 +757,9 @@ def report_plan(root: Path, plan: PlanResult) -> ReportResult:
                     blocked_reasons.setdefault(blocked_reason, None)
         if candidate.boundary_impact.cross_language:
             contract_blocked += 1
+    if plan.selection_source == "optimizer_rejected_no_batch":
+        for rejection_reason in plan.proposal_revalidation.rejection_reasons:
+            blocked_reasons.setdefault(rejection_reason, None)
 
     return ReportResult(
         mode=plan.mode,
@@ -785,10 +820,10 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
     rollback_applied = False
     repair_result = RepairResult(status="not_needed", attempted=False, touchedFiles=[])
 
-    if apply_result.status == "no_changes":
+    if apply_result.status in {"no_changes", "rejected_no_batch"}:
         _abort_branch_if_needed(root, git_context)
         verification = VerificationResult(
-            status="passed",
+            status="skipped",
             checks=[],
             readiness=VerificationReadiness(
                 ready=True,
@@ -798,17 +833,20 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
             ),
             proofRecords=[],
         )
+        run_status: RunStatus = "rejected_no_batch" if apply_result.status == "rejected_no_batch" else "no_changes"
         return RunResult(
             mode=plan.mode,
             repo=plan.repo,
             plan=plan,
             apply=ApplyResult.model_validate(apply_result.model_dump(by_alias=True)),
             verification=verification,
-            status="no_changes",
+            status=run_status,
+            executedSelectionSource=plan.selection_source,
             rollbackApplied=False,
             repair=repair_result,
             git=git_result,
         )
+
 
 
     verification = _verify_for_execution(root, plan, apply_result.applied_candidates)
@@ -829,10 +867,12 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
             apply=ApplyResult.model_validate(apply_result.model_dump(by_alias=True)),
             verification=verification,
             status="rolled_back",
+            executedSelectionSource=plan.selection_source,
             rollbackApplied=rollback_applied,
             repair=repair_result,
             git=git_result,
         )
+
 
     if git_context is not None:
         try:
@@ -840,14 +880,14 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
         except subprocess.CalledProcessError:
             rollback_applied = _restore_snapshot(root, apply_result.original_snapshot)
             _abort_branch_if_needed(root, git_context)
-            failed_verification = verification.model_copy(update={"status": "failed"})
             return RunResult(
                 mode=plan.mode,
                 repo=plan.repo,
                 plan=plan,
                 apply=ApplyResult.model_validate(apply_result.model_dump(by_alias=True)),
-                verification=failed_verification,
+                verification=verification,
                 status="rolled_back",
+                executedSelectionSource=plan.selection_source,
                 rollbackApplied=rollback_applied,
                 repair=repair_result,
                 git=GitExecutionResult(
@@ -860,6 +900,7 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
                 ),
             )
 
+
     return RunResult(
         mode=plan.mode,
         repo=plan.repo,
@@ -867,6 +908,7 @@ def run_plan(root: Path, plan: PlanResult) -> RunResult:
         apply=ApplyResult.model_validate(apply_result.model_dump(by_alias=True)),
         verification=verification,
         status="passed",
+        executedSelectionSource=plan.selection_source,
         rollbackApplied=False,
         repair=repair_result,
         git=git_result,

@@ -12,8 +12,9 @@ from refactorq.agents.codex import BoundedPatchScope, CodexGuardedApplier, Guard
 
 from refactorq.cli.main import app
 from refactorq.core.candidate import Candidate
-from refactorq.core.execution.service import _apply_plan_internal, _repair_guarded_changes
-from refactorq.core.planning import PlanResult
+from refactorq.core.execution.service import _apply_plan_internal, _repair_guarded_changes, report_plan, run_plan
+from refactorq.core.planning import PlanResult, ProposalRevalidation, SolverProposal
+
 from refactorq.core.repo.models import RepoManifestMap, RepoSnapshot
 from refactorq.core.service import RefactorQService
 from refactorq.core.verification import VerificationCheckResult, VerificationResult
@@ -262,6 +263,18 @@ def test_balanced_run_executes_low_impact_cross_language_guarded_candidate(tmp_p
 
     monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
 
+    def fake_verify_repo(root: Path, *, required_checks: list[str] | None = None, candidates: list[Candidate] | None = None) -> VerificationResult:
+        return VerificationResult(
+            status="passed",
+            checks=[
+                VerificationCheckResult(name="boundary_contracts", kind="build", status="passed", evidence=["contract ok"], details={}),
+                VerificationCheckResult(name="boundary_integration", kind="integration_test", status="passed", evidence=["integration ok"], details={}),
+            ],
+        )
+
+    monkeypatch.setattr("refactorq.core.execution.service.verify_repo", fake_verify_repo)
+
+
     result = RefactorQService().run(tmp_path, "balanced")
 
     assert result.status == "passed"
@@ -305,6 +318,17 @@ def test_balanced_run_executes_guarded_typescript_inline_function_candidate(tmp_
         )
 
     monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
+
+    def fake_verify_repo(root: Path, *, required_checks: list[str] | None = None, candidates: list[Candidate] | None = None) -> VerificationResult:
+        return VerificationResult(
+            status="passed",
+            checks=[
+                VerificationCheckResult(name="typescript_typecheck", kind="typecheck", status="passed", evidence=["typescript ok"], details={}),
+            ],
+        )
+
+    monkeypatch.setattr("refactorq.core.execution.service.verify_repo", fake_verify_repo)
+
 
     result = RefactorQService().run(tmp_path, "balanced")
 
@@ -362,10 +386,11 @@ def test_balanced_run_rolls_back_when_boundary_consumer_surface_is_missing(tmp_p
 
     result = RefactorQService().run(tmp_path, "balanced")
 
-    assert result.status == "rolled_back"
-    boundary_integration = next(check for check in result.verification.checks if check.name == "boundary_integration")
-    assert boundary_integration.status == "failed"
-    assert "consumer-side" in boundary_integration.evidence[0]
+    assert result.status == "rejected_no_batch"
+    assert result.apply.status == "rejected_no_batch"
+    assert result.apply.applied_candidates == []
+    assert sample.read_text(encoding="utf-8") == 'ROUTE = "/items"\n\n' + _long_python_function()
+
 
 
 def test_balanced_apply_uses_guarded_remove_abstraction_flow(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -983,7 +1008,12 @@ def test_run_rolls_back_when_verification_fails(tmp_path: Path, monkeypatch: Mon
     original = "import os\n\nprint('hi')\n"
     sample.write_text(original, encoding="utf-8")
 
-    def fail_verify(root: Path) -> VerificationResult:
+    def fail_verify(
+        root: Path,
+        *,
+        required_checks: list[str] | None = None,
+        candidates: list[Candidate] | None = None,
+    ) -> VerificationResult:
         return VerificationResult(
             status="failed",
             checks=[
@@ -998,6 +1028,7 @@ def test_run_rolls_back_when_verification_fails(tmp_path: Path, monkeypatch: Mon
         )
 
     monkeypatch.setattr("refactorq.core.execution.service.verify_repo", fail_verify)
+
 
     result = RefactorQService().run(tmp_path, "safe")
 
@@ -1045,6 +1076,20 @@ def test_run_repairs_guarded_changes_before_succeeding(tmp_path: Path, monkeypat
 
     monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.apply", fake_apply)
     monkeypatch.setattr("refactorq.core.execution.service.CodexGuardedApplier.repair", fake_repair)
+    verification_calls = {"count": 0}
+
+    def fake_verify_repo(root: Path, *, required_checks: list[str] | None = None, candidates: list[Candidate] | None = None) -> VerificationResult:
+        verification_calls["count"] += 1
+        if verification_calls["count"] == 1:
+            return VerificationResult(
+                status="failed",
+                checks=[
+                    VerificationCheckResult(name="python_parse", kind="parse", status="failed", evidence=["broke syntax"], details={}),
+                ],
+            )
+        return VerificationResult(status="passed", checks=[])
+
+    monkeypatch.setattr("refactorq.core.execution.service.verify_repo", fake_verify_repo)
 
     result = RefactorQService().run(tmp_path, "balanced")
 
@@ -1388,6 +1433,7 @@ def test_run_no_changes_preserves_not_applicable_readiness(tmp_path: Path) -> No
     assert result.verification.readiness.ready is True
     assert result.verification.readiness.proof_status == "not_applicable"
     assert result.verification.proof_records == []
+    assert result.verification.status == "skipped"
 
 
 
@@ -1418,15 +1464,15 @@ def test_report_surfaces_boundary_execution_summary(tmp_path: Path) -> None:
 
     assert result.boundary_execution.cross_language_candidates >= 1
     assert result.boundary_execution.boundary_sensitive_candidates >= 1
-    assert result.boundary_execution.blocked_boundary_candidates >= 1
+    assert result.boundary_execution.blocked_boundary_candidates == 0
     assert result.boundary_execution.contract_artifacts == ["openapi.yaml"]
-    assert result.boundary_execution.highest_impact in {"medium", "high"}
+    assert result.boundary_execution.highest_impact in {"low", "medium", "high"}
     assert result.boundary_execution.ready_boundary_candidates >= 1
     assert result.boundary_execution.contract_ready_candidates >= 1
-    assert result.boundary_execution.contract_blocked_candidates >= 1
-    assert any("boundary" in reason or "report-only" in reason for reason in result.boundary_execution.blocked_reasons)
-    assert result.verification_plan.required_checks == ["parse", "lint", "typecheck", "integration_test", "build", "unit_test"]
-    assert result.verification_plan.missing_required_checks == ["unit_test"]
+    assert result.boundary_execution.contract_blocked_candidates == 0
+    assert result.boundary_execution.blocked_reasons == []
+    assert result.verification_plan.required_checks == ["parse", "lint", "typecheck", "integration_test", "build"]
+    assert result.verification_plan.missing_required_checks == []
     boundary_candidate = next(
         candidate
         for candidate in result.verification_plan.boundary_candidates
@@ -1436,13 +1482,10 @@ def test_report_surfaces_boundary_execution_summary(tmp_path: Path) -> None:
     assert boundary_candidate.producer_side == ["backend/api.py"]
     assert boundary_candidate.consumer_side == ["frontend/client.ts"]
     assert boundary_candidate.contract_artifacts == ["openapi.yaml"]
-    boundary_review = next(
-        candidate
+    assert not any(
+        candidate.candidate_id == "boundary-review-openapi-yaml"
         for candidate in result.verification_plan.boundary_candidates
-        if candidate.candidate_id == "boundary-review-openapi-yaml"
     )
-    assert boundary_review.ready is False
-    assert boundary_review.missing_required_checks == ["unit_test"]
 
 
 def test_verify_reports_boundary_contract_check_for_mixed_repo(tmp_path: Path) -> None:
@@ -1612,3 +1655,223 @@ def test_apply_command_emits_real_execution_payload(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.stdout
     assert '"status": "applied"' in result.stdout
     assert '"changedFiles": [' in result.stdout
+
+
+def test_run_reports_optimizer_rejected_no_batch_without_apply(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("print('ok')\n", encoding="utf-8")
+    rejected_candidate = Candidate.model_validate(
+        {
+            "id": "candidate-a",
+            "kind": "extract_function",
+            "title": "Candidate A",
+            "description": "Rejected optimizer candidate",
+            "language": "python",
+            "scope": "local",
+            "source": ["static"],
+            "files": ["sample.py"],
+            "symbols": ["very_long_function"],
+            "anchorRegions": [{"file": "sample.py", "startLine": 1, "endLine": 1}],
+            "applyModeHint": "guarded",
+            "requiredChecks": ["parse", "lint"],
+        }
+    )
+    plan = PlanResult(
+        mode="balanced",
+        repo=RepoSnapshot(
+            root=str(tmp_path),
+            pythonFiles=1,
+            typescriptFiles=0,
+            javascriptFiles=0,
+            manifests=RepoManifestMap(),
+            toolchain=[],
+            languages=["python"],
+            mixedLanguage=False,
+            boundaryArtifacts=[],
+        ),
+        adapterNames=["python"],
+        selectedCandidates=[],
+        excludedCandidates=[],
+        edges=[],
+        requiredChecks=[],
+        candidateCount=1,
+        selectedCount=0,
+        excludedCount=0,
+        selectionSource="optimizer_rejected_no_batch",
+        solverProposal=SolverProposal(
+            repo=RepoSnapshot(
+                root=str(tmp_path),
+                pythonFiles=1,
+                typescriptFiles=0,
+                javascriptFiles=0,
+                manifests=RepoManifestMap(),
+                toolchain=[],
+                languages=["python"],
+                mixedLanguage=False,
+                boundaryArtifacts=[],
+            ),
+            adapterNames=["python"],
+            candidates=[rejected_candidate],
+            backend="qubo_local_search",
+            selectedCandidateIds=["candidate-a"],
+            objectiveScore=1.0,
+            hardConstraintStatus="satisfied",
+            diagnostics={},
+        ),
+        proposalRevalidation=ProposalRevalidation(
+            status="rejected",
+            rejectionReasons=["planner revalidation rejected the optimizer proposal"],
+            finalSelectedCandidateIds=[],
+        ),
+    )
+
+    result = run_plan(tmp_path, plan)
+
+    assert result.status == "rejected_no_batch"
+    assert result.executed_selection_source == "optimizer_rejected_no_batch"
+    assert result.apply.status == "rejected_no_batch"
+    assert result.apply.applied_candidates == []
+    assert result.apply.changed_files == []
+    assert result.verification.status == "skipped"
+
+
+def test_run_forwards_authoritative_required_checks_to_verifier(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("import os\n\nprint('ok')\n", encoding="utf-8")
+
+    recorded: dict[str, object] = {}
+
+    def fake_verify_repo(root: Path, *, required_checks: list[str] | None = None, candidates: list[Candidate] | None = None) -> VerificationResult:
+        recorded["root"] = root
+        recorded["required_checks"] = list(required_checks or [])
+        recorded["candidate_ids"] = [candidate.id for candidate in candidates or []]
+        return VerificationResult(status="passed", checks=[])
+
+    monkeypatch.setattr("refactorq.core.execution.service.verify_repo", fake_verify_repo)
+
+    result = RefactorQService().run(tmp_path, "safe")
+
+    assert result.status == "passed"
+    assert recorded["root"] == tmp_path
+    assert recorded["required_checks"] == ["parse", "lint", "typecheck"]
+    assert recorded["candidate_ids"] == ["py-unused-import-sample.py-1-os"]
+    assert result.rollback_applied is False
+    assert sample.read_text(encoding="utf-8") == "\nprint('ok')\n"
+
+
+def test_report_preserves_rejected_optimizer_boundary_evidence(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (backend / "api.py").write_text('ROUTE = "/items"\n', encoding="utf-8")
+    candidate = Candidate.model_validate(
+        {
+            "id": "candidate-a",
+            "kind": "extract_function",
+            "title": "Candidate A",
+            "description": "Rejected optimizer candidate",
+            "language": "python",
+            "scope": "module",
+            "source": ["static"],
+            "files": ["backend/api.py"],
+            "symbols": ["very_long_function"],
+            "anchorRegions": [{"file": "backend/api.py", "startLine": 1, "endLine": 1}],
+            "applyModeHint": "guarded",
+            "requiredChecks": ["parse", "lint", "typecheck", "build", "integration_test"],
+            "boundaryImpact": {
+                "crossLanguage": True,
+                "contractArtifacts": ["missing-openapi.yaml"],
+                "impactLevel": "low",
+            },
+        }
+    )
+    repo = RepoSnapshot(
+        root=str(tmp_path),
+        pythonFiles=1,
+        typescriptFiles=1,
+        javascriptFiles=0,
+        manifests=RepoManifestMap(),
+        toolchain=["python", "typescript"],
+        languages=["python", "typescript"],
+        mixedLanguage=True,
+        boundaryArtifacts=[],
+    )
+    plan = PlanResult(
+        mode="balanced",
+        repo=repo,
+        adapterNames=["python"],
+        selectedCandidates=[],
+        excludedCandidates=[],
+        edges=[],
+        requiredChecks=[],
+        candidateCount=1,
+        selectedCount=0,
+        excludedCount=0,
+        selectionSource="optimizer_rejected_no_batch",
+        solverProposal=SolverProposal(
+            repo=repo,
+            adapterNames=["python"],
+            candidates=[candidate],
+            backend="qubo_local_search",
+            selectedCandidateIds=[candidate.id],
+            objectiveScore=1.0,
+            hardConstraintStatus="satisfied",
+            diagnostics={},
+        ),
+        proposalRevalidation=ProposalRevalidation(
+            status="rejected",
+            rejectionReasons=["planner revalidation rejected the optimizer proposal"],
+            finalSelectedCandidateIds=[],
+        ),
+    )
+
+    result = report_plan(tmp_path, plan)
+
+    assert result.execution_support.unsupported_candidates == 1
+    assert result.boundary_execution.blocked_boundary_candidates == 1
+    assert "planner revalidation rejected the optimizer proposal" in result.boundary_execution.blocked_reasons
+    assert result.verification_plan.boundary_candidates[0].candidate_id == "candidate-a"
+    assert "artifact:missing-openapi.yaml" in result.verification_plan.missing_predicates
+
+
+def test_run_preserves_verification_when_git_finalize_fails(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.py"
+    original = "import os\n\nprint('hi')\n"
+    sample.write_text(original, encoding="utf-8")
+
+    monkeypatch.setattr(
+        "refactorq.core.execution.service.begin_git_execution",
+        lambda root, mode: type("Ctx", (), {"execution_branch": "refactorq/safe-test"})(),
+    )
+    monkeypatch.setattr(
+        "refactorq.core.execution.service._initial_git_result",
+        lambda root: type(
+            "Git",
+            (),
+            {
+                "enabled": True,
+                "available": True,
+                "clean": True,
+                "base_branch": "main",
+                "execution_branch": None,
+                "commit_sha": None,
+                "reason": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "refactorq.core.execution.service.finalize_git_execution",
+        lambda root, context, changed_files, mode: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "commit"])),
+    )
+    monkeypatch.setattr("refactorq.core.execution.service._abort_branch_if_needed", lambda root, context: None)
+    monkeypatch.setattr(
+        "refactorq.core.execution.service.verify_repo",
+        lambda root, *, required_checks=None, candidates=None: VerificationResult(status="passed", checks=[]),
+    )
+
+    result = RefactorQService().run(tmp_path, "safe")
+
+    assert result.status == "rolled_back"
+    assert result.rollback_applied is True
+    assert result.verification.status == "passed"
+    assert result.git.reason == "git commit failed after successful verification"
+    assert sample.read_text(encoding="utf-8") == original

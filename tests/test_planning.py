@@ -4,13 +4,14 @@ from pathlib import Path
 
 from refactorq.adapters.python import PythonAdapter
 from refactorq.core.candidate import Candidate
-from refactorq.core.planning import build_plan
+from refactorq.core.planning import GreedySelectionBackend, QuboLocalSearchSolver, build_plan
+from refactorq.core.planning.service import build_optimizer_problem
 from refactorq.core.repo.models import RepoManifestMap, RepoSnapshot
 
 
-def _repo_snapshot() -> RepoSnapshot:
+def _repo_snapshot(root: str = "/tmp/repo", *, boundary_artifacts: list[str] | None = None) -> RepoSnapshot:
     return RepoSnapshot(
-        root="/tmp/repo",
+        root=root,
         pythonFiles=1,
         typescriptFiles=1,
         javascriptFiles=0,
@@ -18,8 +19,9 @@ def _repo_snapshot() -> RepoSnapshot:
         toolchain=["python", "typescript"],
         languages=["python", "typescript"],
         mixedLanguage=True,
-        boundaryArtifacts=[],
+        boundaryArtifacts=boundary_artifacts or [],
     )
+
 
 
 def _candidate(
@@ -147,7 +149,15 @@ def test_balanced_mode_retries_candidates_when_dependency_becomes_satisfied() ->
 
 
 
-def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
+def test_balanced_mode_surfaces_exclusions_with_reasons(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    frontend = tmp_path / "frontend"
+    backend.mkdir()
+    frontend.mkdir()
+    (backend / "api.py").write_text('ROUTE = "/items"\n', encoding="utf-8")
+    (frontend / "client.ts").write_text('export const route = "/items";\n', encoding="utf-8")
+    (tmp_path / "openapi.yaml").write_text("openapi: 3.1.0\npaths:\n  /items:\n    get:\n      operationId: listItems\n", encoding="utf-8")
+
     guarded_cross_language = Candidate.model_validate(
         {
             **_candidate(
@@ -177,7 +187,12 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
         ),
     ]
 
-    result = build_plan(mode="balanced", repo=_repo_snapshot(), adapter_names=["python"], candidates=candidates)
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(str(tmp_path), boundary_artifacts=["openapi.yaml"]),
+        adapter_names=["python"],
+        candidates=candidates,
+    )
 
     assert [candidate.id for candidate in result.selected_candidates] == ["auto-ok", "guarded-ok", "cross-language-low", "guarded-cross-language-low"]
     excluded = {item.candidate.id: item.reason for item in result.excluded_candidates}
@@ -190,6 +205,7 @@ def test_balanced_mode_surfaces_exclusions_with_reasons() -> None:
         excluded["bridge-guess"]
         == "unsupported TypeScript bridge guess excluded until worker-backed semantics are available"
     )
+
 
 def test_report_mode_preserves_deterministic_ranking_order() -> None:
     candidates = [
@@ -235,7 +251,12 @@ def test_report_mode_prioritizes_candidate_value_over_apply_mode() -> None:
         candidates=[low_value_auto, high_value_report],
     )
 
-    assert [candidate.id for candidate in result.selected_candidates] == ["high-value-report", "low-value-auto"]
+    assert [candidate.id for candidate in result.selected_candidates] == ["low-value-auto"]
+    assert result.selection_source == "planner_override_of_optimizer"
+    assert result.proposal_revalidation.status == "overridden"
+    assert result.baseline_comparison is not None
+    assert result.baseline_comparison.heuristic_selected_candidate_ids == ["high-value-report", "low-value-auto"]
+    assert result.baseline_comparison.optimizer_selected_candidate_ids
 
 
 def test_safe_mode_enforces_batch_candidate_budget() -> None:
@@ -814,3 +835,166 @@ def test_emitted_candidate_serialization_covers_full_floor(tmp_path: Path) -> No
         "provenance",
     ]:
         assert key in payload
+
+
+def test_build_optimizer_problem_preserves_shared_budget_and_candidate_features() -> None:
+    guarded = Candidate.model_validate(
+        {
+            **_candidate(
+                "guarded-proposal",
+                apply_mode_hint="guarded",
+                files=["src/guarded.py"],
+                symbols=["guarded_symbol"],
+                semantic_risk=0.45,
+            ).model_dump(by_alias=True),
+            "kind": "extract_function",
+        }
+    )
+    duplicate = Candidate.model_validate(
+        {
+            **_candidate(
+                "duplicate-proposal",
+                files=["src/duplicate.py"],
+                symbols=["dup_symbol"],
+                maintainability_gain=0.6,
+                conflicts=["guarded-proposal"],
+            ).model_dump(by_alias=True),
+            "kind": "duplicate_logic",
+        }
+    )
+
+    problem = build_optimizer_problem(
+        mode="balanced",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[guarded, duplicate],
+    )
+
+    assert problem.budget.mode_budget == 24
+    assert problem.budget.max_files == 16
+    assert [item.candidate.id for item in problem.candidates] == ["guarded-proposal", "duplicate-proposal"]
+    by_id = {item.candidate.id: item for item in problem.candidates}
+    assert by_id["guarded-proposal"].guarded is True
+    assert by_id["guarded-proposal"].high_risk is True
+    assert by_id["duplicate-proposal"].conflict_ids == ["guarded-proposal"]
+
+
+
+def test_optimizer_backends_share_problem_model_and_emit_distinct_backend_names() -> None:
+    first = Candidate.model_validate(
+        {
+            **_candidate(
+                "alpha",
+                files=["src/a.py"],
+                symbols=["alpha"],
+                maintainability_gain=0.35,
+                semantic_risk=0.05,
+            ).model_dump(by_alias=True),
+            "kind": "unused_import",
+        }
+    )
+    second = Candidate.model_validate(
+        {
+            **_candidate(
+                "beta",
+                files=["src/b.py"],
+                symbols=["beta"],
+                maintainability_gain=0.30,
+                semantic_risk=0.05,
+            ).model_dump(by_alias=True),
+            "kind": "unused_import",
+        }
+    )
+
+    problem = build_optimizer_problem(
+        mode="safe",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[first, second],
+    )
+
+    greedy = GreedySelectionBackend().solve(problem)
+    qubo = QuboLocalSearchSolver().solve(problem)
+
+    assert greedy.backend == "greedy"
+    assert qubo.backend == "qubo_local_search"
+    assert greedy.selected_candidate_ids
+    assert qubo.selected_candidate_ids
+    assert set(greedy.selected_candidate_ids).issubset({"alpha", "beta"})
+    assert set(qubo.selected_candidate_ids).issubset({"alpha", "beta"})
+    assert greedy.hard_constraint_status == "satisfied"
+    assert qubo.hard_constraint_status == "satisfied"
+
+
+def test_build_plan_surfaces_accepted_optimizer_selection_source() -> None:
+    first = Candidate.model_validate(
+        {
+            **_candidate(
+                "optimizer-alpha",
+                files=["src/a.py"],
+                symbols=["alpha"],
+                maintainability_gain=0.35,
+                semantic_risk=0.05,
+            ).model_dump(by_alias=True),
+            "kind": "unused_import",
+        }
+    )
+    second = Candidate.model_validate(
+        {
+            **_candidate(
+                "optimizer-beta",
+                files=["src/b.py"],
+                symbols=["beta"],
+                maintainability_gain=0.30,
+                semantic_risk=0.05,
+            ).model_dump(by_alias=True),
+            "kind": "unused_import",
+        }
+    )
+
+    result = build_plan(
+        mode="report",
+        repo=_repo_snapshot(),
+        adapter_names=["python"],
+        candidates=[first, second],
+    )
+
+    assert result.selection_source == "optimizer_qubo"
+    assert result.proposal_revalidation.status == "accepted"
+    assert result.solver_proposal is not None
+    assert result.solver_proposal.backend == "qubo_local_search"
+    assert result.proposal_revalidation.final_selected_candidate_ids == [candidate.id for candidate in result.selected_candidates]
+
+def test_build_plan_rejects_optimizer_candidates_without_boundary_readiness(tmp_path: Path) -> None:
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (backend / "api.py").write_text('ROUTE = "/items"\n', encoding="utf-8")
+
+    candidate = Candidate.model_validate(
+        {
+            **_candidate(
+                "optimizer-boundary",
+                apply_mode_hint="guarded",
+                cross_language=True,
+                impact_level="low",
+                files=["backend/api.py"],
+                contract_artifacts=["missing-openapi.yaml"],
+                required_checks=["parse", "lint", "typecheck", "build", "integration_test"],
+            ).model_dump(by_alias=True),
+            "kind": "extract_function",
+            "scope": "module",
+        }
+    )
+
+    result = build_plan(
+        mode="balanced",
+        repo=_repo_snapshot(str(tmp_path), boundary_artifacts=[]),
+        adapter_names=["python"],
+        candidates=[candidate],
+    )
+
+    assert result.selection_source == "optimizer_rejected_no_batch"
+    assert result.proposal_revalidation.status == "rejected"
+    assert result.selected_candidates == []
+    assert result.excluded_candidates[0].candidate.id == "optimizer-boundary"
+    assert "boundary contract artifacts are missing from the working tree" in result.excluded_candidates[0].reason

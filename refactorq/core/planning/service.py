@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable
 
 from refactorq.core.candidate import Candidate
 from refactorq.core.repo import RepoSnapshot
+from refactorq.core.verification.service import candidate_verification_state
 
-from .models import ExcludedCandidate, PlanEdge, PlanMode, PlanResult, SolverProposal
+from .models import BaselineComparison, ExcludedCandidate, PlanEdge, PlanMode, PlanResult, ProposalRevalidation, SelectionSource, SolverProposal
+from .optimizer import GreedySelectionBackend, OptimizerBudget, OptimizerCandidateInput, OptimizerProblem, QuboLocalSearchSolver
+
+
 _APPLY_MODE_PRIORITY = {"auto": 0, "guarded": 1, "report_only": 2}
 _IMPACT_PRIORITY = {"none": 0, "low": 1, "medium": 2, "high": 3}
 _MODE_BATCH_LIMITS = {
@@ -286,6 +291,27 @@ def _filter_candidates(candidates: Iterable[Candidate], mode: PlanMode) -> tuple
     return selected, excluded
 
 
+def _planner_revalidate_candidates(root: Path, candidates: Iterable[Candidate], mode: PlanMode) -> tuple[list[Candidate], list[ExcludedCandidate]]:
+    selected, excluded = _filter_candidates(candidates, mode)
+    authoritative: list[Candidate] = []
+    readiness_excluded: list[ExcludedCandidate] = []
+    for candidate in selected:
+        state = candidate_verification_state(root, candidate)
+        if bool(state["ready"]):
+            authoritative.append(candidate)
+            continue
+        blocked_reasons = [str(reason) for reason in state.get("blockedReasons", [])]
+        missing_predicates = [str(predicate) for predicate in state.get("missingPredicates", [])]
+        reason = blocked_reasons[0] if blocked_reasons else (
+            missing_predicates[0]
+            if missing_predicates
+            else "planner revalidation rejected candidate due to verification readiness"
+        )
+        readiness_excluded.append(ExcludedCandidate(candidate=candidate, reason=reason))
+    return authoritative, [*excluded, *readiness_excluded]
+
+
+
 def _regions_overlap(left: Candidate, right: Candidate) -> bool:
     for left_region in left.anchor_regions:
         for right_region in right.anchor_regions:
@@ -355,6 +381,55 @@ def _conflict_edges(candidates: list[Candidate]) -> list[PlanEdge]:
             for reason in _pairwise_conflict_reasons(left, right):
                 add_edge(left, right, reason)
     return edges
+
+
+def _optimizer_budget(mode: PlanMode) -> OptimizerBudget:
+    limits = _MODE_BATCH_LIMITS.get(mode, _MODE_BATCH_LIMITS["balanced"])
+    return OptimizerBudget(
+        modeBudget=limits["max_candidates"],
+        maxFiles=limits["max_files"],
+    )
+
+
+
+def build_optimizer_problem(
+    *,
+    mode: PlanMode,
+    repo: RepoSnapshot,
+    adapter_names: list[str],
+    candidates: list[Candidate],
+) -> OptimizerProblem:
+    conflict_ids: dict[str, set[str]] = {candidate.id: set(candidate.conflicts) for candidate in candidates}
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1 :]:
+            if _pairwise_conflict_reasons(left, right):
+                conflict_ids[left.id].add(right.id)
+                conflict_ids[right.id].add(left.id)
+
+    optimizer_candidates = [
+        OptimizerCandidateInput(
+            candidate=candidate,
+            baseScore=_candidate_score(candidate),
+            diffLines=_candidate_diff_lines(candidate),
+            files=list(candidate.files),
+            guarded=candidate.apply_mode_hint == "guarded",
+            highRisk=_is_high_risk(candidate),
+            conflictIds=sorted(conflict_ids[candidate.id]),
+        )
+        for candidate in candidates
+    ]
+    return OptimizerProblem(
+        repo=repo,
+        adapterNames=adapter_names,
+        mode=mode,
+        budget=_optimizer_budget(mode),
+        candidates=optimizer_candidates,
+    )
+
+
+
+def _optimizer_backend_for(mode: PlanMode) -> GreedySelectionBackend | QuboLocalSearchSolver:
+    return QuboLocalSearchSolver() if mode in {"balanced", "report"} else GreedySelectionBackend()
 
 
 def _is_duplicate_extract_dependency(left: Candidate, right: Candidate) -> bool:
@@ -486,14 +561,156 @@ def _required_checks(candidates: list[Candidate]) -> list[str]:
     return list(ordered)
 
 
+
+def _optimizer_candidate_pool(candidates: Iterable[Candidate], mode: PlanMode) -> list[Candidate]:
+    filter_fn = {
+        "safe": _safe_filter,
+        "balanced": _balanced_filter,
+        "report": _report_filter,
+    }[mode]
+    eligible: list[Candidate] = []
+    for candidate in sorted(candidates, key=_ranking_key):
+        if filter_fn(candidate) is None:
+            eligible.append(candidate)
+    return eligible
+
+
+def _selection_source_from_backend(backend: str | None) -> SelectionSource:
+
+    if backend == "greedy":
+        return "optimizer_greedy"
+    if backend == "qubo_local_search":
+        return "optimizer_qubo"
+    return "heuristic"
+
+
+
+def _merge_authoritative_exclusions(
+    all_candidates: list[Candidate],
+    initial_excluded: list[ExcludedCandidate],
+    *,
+    proposed_ids: set[str],
+    selected_ids: set[str],
+    revalidated_excluded: list[ExcludedCandidate],
+) -> list[ExcludedCandidate]:
+    merged: dict[str, ExcludedCandidate] = {item.candidate.id: item for item in initial_excluded}
+    for item in revalidated_excluded:
+        merged[item.candidate.id] = item
+    for candidate in all_candidates:
+        if candidate.id in selected_ids or candidate.id in merged:
+            continue
+        if candidate.id in proposed_ids:
+            merged[item_id := candidate.id] = ExcludedCandidate(
+                candidate=candidate,
+                reason="planner revalidation removed optimizer candidate from the authoritative batch",
+            )
+            continue
+        merged[candidate.id] = ExcludedCandidate(
+            candidate=candidate,
+            reason="optimizer proposal did not select candidate",
+        )
+    return sorted(merged.values(), key=lambda item: _ranking_key(item.candidate))
+
 def build_plan(*, mode: PlanMode, repo: RepoSnapshot, adapter_names: list[str], candidates: list[Candidate]) -> PlanResult:
     proposal = normalize_solver_proposal(repo=repo, adapter_names=adapter_names, candidates=candidates)
-    selected, excluded = _filter_candidates(proposal.candidates, mode)
+    root = Path(proposal.repo.root)
+    heuristic_selected, _ = _filter_candidates(proposal.candidates, mode)
+    selected, excluded = _planner_revalidate_candidates(root, proposal.candidates, mode)
+    selection_source: SelectionSource = "heuristic"
+    proposal_revalidation = ProposalRevalidation()
+
+    optimizer_pool = _optimizer_candidate_pool(proposal.candidates, mode)
+    solver_proposal = None
+    baseline_comparison = None
+    if optimizer_pool:
+        optimizer_problem = build_optimizer_problem(
+            mode=mode,
+            repo=proposal.repo,
+            adapter_names=proposal.adapter_names,
+            candidates=optimizer_pool,
+        )
+        solver_proposal = _optimizer_backend_for(mode).solve(optimizer_problem)
+        baseline_comparison = BaselineComparison(
+            heuristicSelectedCandidateIds=[candidate.id for candidate in heuristic_selected],
+            optimizerSelectedCandidateIds=list(solver_proposal.selected_candidate_ids),
+        )
+        proposed_by_id = {candidate.id: candidate for candidate in proposal.candidates}
+        proposed_candidates = [
+            proposed_by_id[candidate_id]
+            for candidate_id in solver_proposal.selected_candidate_ids
+            if candidate_id in proposed_by_id
+        ]
+        revalidation_mode: PlanMode = "balanced" if mode == "report" else mode
+        revalidated_selected, revalidated_excluded = _planner_revalidate_candidates(root, proposed_candidates, revalidation_mode)
+        final_ids = [candidate.id for candidate in revalidated_selected]
+        proposed_ids = set(solver_proposal.selected_candidate_ids)
+        selected_ids = set(final_ids)
+
+        if not solver_proposal.selected_candidate_ids:
+            selected = []
+            excluded = _merge_authoritative_exclusions(
+                proposal.candidates,
+                excluded,
+                proposed_ids=set(),
+                selected_ids=set(),
+                revalidated_excluded=[],
+            )
+            selection_source = _selection_source_from_backend(solver_proposal.backend)
+            proposal_revalidation = ProposalRevalidation(
+                status="accepted",
+                finalSelectedCandidateIds=[],
+            )
+        elif set(final_ids) == set(solver_proposal.selected_candidate_ids) and len(final_ids) == len(solver_proposal.selected_candidate_ids):
+            selected = revalidated_selected
+            excluded = _merge_authoritative_exclusions(
+                proposal.candidates,
+                excluded,
+                proposed_ids=proposed_ids,
+                selected_ids=selected_ids,
+                revalidated_excluded=revalidated_excluded,
+            )
+            selection_source = _selection_source_from_backend(solver_proposal.backend)
+            proposal_revalidation = ProposalRevalidation(
+                status="accepted",
+                finalSelectedCandidateIds=final_ids,
+            )
+        elif final_ids:
+            selected = revalidated_selected
+            excluded = _merge_authoritative_exclusions(
+                proposal.candidates,
+                excluded,
+                proposed_ids=proposed_ids,
+                selected_ids=selected_ids,
+                revalidated_excluded=revalidated_excluded,
+            )
+            selection_source = "planner_override_of_optimizer"
+            proposal_revalidation = ProposalRevalidation(
+                status="overridden",
+                rejectionReasons=[item.reason for item in revalidated_excluded],
+                finalSelectedCandidateIds=final_ids,
+            )
+        else:
+            selected = []
+            excluded = _merge_authoritative_exclusions(
+                proposal.candidates,
+                excluded,
+                proposed_ids=proposed_ids,
+                selected_ids=set(),
+                revalidated_excluded=revalidated_excluded,
+            )
+            selection_source = "optimizer_rejected_no_batch"
+            proposal_revalidation = ProposalRevalidation(
+                status="rejected",
+                rejectionReasons=[item.reason for item in revalidated_excluded] or ["planner revalidation rejected the optimizer proposal"],
+                finalSelectedCandidateIds=[],
+            )
+
     edge_candidates = [*selected, *[item.candidate for item in excluded]]
     edges = _conflict_edges(edge_candidates)
     edges.extend(_dependency_edges(edge_candidates))
     edges.extend(_synergy_edges(edge_candidates))
     ordered_edges = sorted(edges, key=lambda edge: (edge.kind, edge.from_id, edge.to_id, edge.reason))
+
     return PlanResult(
         mode=mode,
         repo=proposal.repo,
@@ -505,4 +722,8 @@ def build_plan(*, mode: PlanMode, repo: RepoSnapshot, adapter_names: list[str], 
         candidateCount=len(proposal.candidates),
         selectedCount=len(selected),
         excludedCount=len(excluded),
+        selectionSource=selection_source,
+        solverProposal=solver_proposal,
+        proposalRevalidation=proposal_revalidation,
+        baselineComparison=baseline_comparison,
     )

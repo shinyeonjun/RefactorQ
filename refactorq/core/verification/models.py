@@ -47,7 +47,7 @@ class VerificationReadiness(BaseModel):
 
 
 class VerificationReport(BaseModel):
-    status: Literal["passed", "failed"]
+    status: VerificationStatus
     checks: list[VerificationCheckResult] = Field(default_factory=list)
     readiness: VerificationReadiness = Field(default_factory=VerificationReadiness)
     proof_records: list[ProofRecord] = Field(default_factory=list, alias="proofRecords")

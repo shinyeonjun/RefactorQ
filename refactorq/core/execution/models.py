@@ -10,9 +10,10 @@ from refactorq.core.repo import RepoSnapshot
 from refactorq.core.verification import ProofStatus, VerificationResult
 
 
-ApplyStatus = Literal["applied", "no_changes"]
-RunStatus = Literal["passed", "rolled_back", "no_changes"]
+ApplyStatus = Literal["applied", "no_changes", "rejected_no_batch"]
+RunStatus = Literal["passed", "rolled_back", "no_changes", "rejected_no_batch"]
 RepairStatus = Literal["not_needed", "repaired", "failed", "skipped"]
+
 
 
 class ExecutionCandidateNote(BaseModel):
@@ -120,6 +121,7 @@ class RunResult(BaseModel):
     apply: ApplyResult
     verification: VerificationResult
     status: RunStatus
+    executed_selection_source: str = Field(default="heuristic", alias="executedSelectionSource")
     rollback_applied: bool = Field(alias="rollbackApplied")
     repair: RepairResult
     git: GitExecutionResult
