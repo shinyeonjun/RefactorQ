@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -152,6 +153,24 @@ def test_scan_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path
     assert '"root"' in result.stdout
 
 
+def test_scan_command_preserves_legacy_machine_json_output(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    @contextmanager
+    def fake_normalize(source: str | Path) -> Iterator[SimpleNamespace]:
+        yield SimpleNamespace(analysis_root=tmp_path)
+
+    monkeypatch.setattr(service_module, "normalize_repo_source", fake_normalize)
+    monkeypatch.setattr(service_module, "detect_repo", _repo_snapshot)
+    monkeypatch.setattr(service_module, "detect_adapters", lambda root: [])
+
+    result = runner.invoke(app, ["scan", str(tmp_path)])
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["repo"]["root"] == str(tmp_path.resolve())
+    assert payload["adapterNames"] == []
+    assert payload["candidates"] == []
+
+
 def test_plan_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 
@@ -205,7 +224,7 @@ def test_verify_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_pa
 
     assert result.exit_code == 0, result.stdout
     assert calls["source"] == "https://github.com/acme/project"
-    assert '"status": "passed"' in result.stdout
+    assert json.loads(result.stdout)["status"] == "passed"
 
 
 def test_apply_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
@@ -225,7 +244,7 @@ def test_apply_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_pat
 
     assert result.exit_code == 0, result.stdout
     assert calls == {"source": "https://github.com/acme/project", "mutable": True}
-    assert '"sourceKind": "github_clone"' in result.stdout
+    assert json.loads(result.stdout)["sourceKind"] == "github_clone"
 
 
 def test_report_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
@@ -264,8 +283,7 @@ def test_run_command_accepts_github_repo_url(monkeypatch: MonkeyPatch, tmp_path:
 
     assert result.exit_code == 0, result.stdout
     assert calls == {"source": "https://github.com/acme/project", "mutable": True}
-    assert '"sourceKind": "github_clone"' in result.stdout
-
+    assert json.loads(result.stdout)["sourceKind"] == "github_clone"
 
 def test_deferred_cleanup_runs_on_next_normalization(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     deferred_record = tmp_path / "cleanup.json"

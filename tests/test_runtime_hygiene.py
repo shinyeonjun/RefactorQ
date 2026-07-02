@@ -76,3 +76,22 @@ def test_service_verify_resolves_typescript_node_modules_imports(tmp_path: Path)
 
     assert result.status == "passed"
     assert any(check.name == "typescript_typecheck" and check.status == "passed" for check in result.checks)
+
+
+def test_service_tui_ignores_gjc_runtime_artifacts(tmp_path: Path) -> None:
+    (tmp_path / "sample.py").write_text("import os\n", encoding="utf-8")
+    (tmp_path / "sample.ts").write_text("const unusedValue = 1;\n", encoding="utf-8")
+
+    runtime_root = tmp_path / ".gjc" / "_session-1" / "state" / "team" / "worker-1"
+    runtime_root.mkdir(parents=True)
+    (runtime_root / "sample.py").write_text("import os\n", encoding="utf-8")
+    (runtime_root / "sample.ts").write_text("const unusedValue = 1;\n", encoding="utf-8")
+
+    result = RefactorQService().tui_source(tmp_path)
+
+    candidate_files = {path for row in result.candidate_rows for path in row.files}
+
+    assert result.repo.python_files == 1
+    assert result.repo.typescript_files == 1
+    assert len(result.candidate_rows) == 2
+    assert candidate_files == {"sample.py", "sample.ts"}

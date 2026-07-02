@@ -7,7 +7,9 @@ from .models import (
     ReportResult,
     RunResult,
 )
-from .service import apply_plan, report_plan, run_plan
+from .report import report_plan
+from .run import run_plan
+from .service import apply_plan
 
 __all__ = [
     "ApplyResult",

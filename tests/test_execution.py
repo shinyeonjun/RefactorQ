@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+
+from collections.abc import Iterator
+from contextlib import contextmanager
 import subprocess
 import sys
 from typing import cast
 from pathlib import Path
+from types import SimpleNamespace
 
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
@@ -12,13 +17,17 @@ from refactorq.agents.codex import BoundedPatchScope, CodexGuardedApplier, Guard
 
 from refactorq.cli.main import app
 from refactorq.core.candidate import Candidate
-from refactorq.core.execution.service import _apply_plan_internal, _repair_guarded_changes, report_plan, run_plan
+from refactorq.core.execution.guarded import repair_guarded_changes as _repair_guarded_changes
+from refactorq.core.execution.report import report_plan
+from refactorq.core.execution.run import run_plan
+from refactorq.core.execution.service import _apply_plan_internal
 from refactorq.core.planning import PlanResult, ProposalRevalidation, SolverProposal
 
 from refactorq.core.repo.models import RepoManifestMap, RepoSnapshot
 from refactorq.core.service import RefactorQService
 from refactorq.core.verification import VerificationCheckResult, VerificationResult
-from refactorq.core.verification.service import _npm_command, verify_repo
+from refactorq.core.verification.command_checks import npm_command as _npm_command
+from refactorq.core.verification.service import verify_repo
 
 runner = CliRunner()
 
@@ -1513,7 +1522,7 @@ def test_verify_exposes_not_applicable_readiness_for_single_language_repo(tmp_pa
         command = cast(list[str], args[0])
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
-    monkeypatch.setattr("refactorq.core.verification.service.subprocess.run", fake_run)
+    monkeypatch.setattr("refactorq.core.verification.command_checks.subprocess.run", fake_run)
 
     result = RefactorQService().verify(tmp_path)
 
@@ -1555,7 +1564,7 @@ def test_verify_exposes_proven_boundary_readiness_for_mixed_repo(tmp_path: Path,
         command = cast(list[str], args[0])
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
-    monkeypatch.setattr("refactorq.core.verification.service.subprocess.run", fake_run)
+    monkeypatch.setattr("refactorq.core.verification.command_checks.subprocess.run", fake_run)
     monkeypatch.setattr(
         "refactorq.core.verification.service.TypeScriptAdapter.verify",
         lambda self, root: [
@@ -1593,7 +1602,7 @@ def test_verify_runs_python_toolchain_commands(tmp_path: Path, monkeypatch: Monk
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
-    monkeypatch.setattr("refactorq.core.verification.service.subprocess.run", fake_run)
+    monkeypatch.setattr("refactorq.core.verification.command_checks.subprocess.run", fake_run)
 
     result = RefactorQService().verify(tmp_path)
 
@@ -1625,7 +1634,7 @@ def test_verify_runs_typescript_package_scripts(tmp_path: Path, monkeypatch: Mon
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
 
-    monkeypatch.setattr("refactorq.core.verification.service.subprocess.run", fake_run)
+    monkeypatch.setattr("refactorq.core.verification.command_checks.subprocess.run", fake_run)
     monkeypatch.setattr(
         "refactorq.core.verification.service.TypeScriptAdapter.verify",
         lambda self, root: [
@@ -1653,9 +1662,9 @@ def test_apply_command_emits_real_execution_payload(tmp_path: Path) -> None:
     result = runner.invoke(app, ["apply", str(tmp_path), "--mode", "safe"])
 
     assert result.exit_code == 0, result.stdout
-    assert '"status": "applied"' in result.stdout
-    assert '"changedFiles": [' in result.stdout
-
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "applied"
+    assert payload["changedFiles"]
 
 def test_run_reports_optimizer_rejected_no_batch_without_apply(tmp_path: Path) -> None:
     sample = tmp_path / "sample.py"
@@ -1839,11 +1848,11 @@ def test_run_preserves_verification_when_git_finalize_fails(tmp_path: Path, monk
     sample.write_text(original, encoding="utf-8")
 
     monkeypatch.setattr(
-        "refactorq.core.execution.service.begin_git_execution",
+        "refactorq.core.execution.run.begin_git_execution",
         lambda root, mode: type("Ctx", (), {"execution_branch": "refactorq/safe-test"})(),
     )
     monkeypatch.setattr(
-        "refactorq.core.execution.service._initial_git_result",
+        "refactorq.core.execution.run._initial_git_result",
         lambda root: type(
             "Git",
             (),
@@ -1859,10 +1868,10 @@ def test_run_preserves_verification_when_git_finalize_fails(tmp_path: Path, monk
         )(),
     )
     monkeypatch.setattr(
-        "refactorq.core.execution.service.finalize_git_execution",
+        "refactorq.core.execution.run.finalize_git_execution",
         lambda root, context, changed_files, mode: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["git", "commit"])),
     )
-    monkeypatch.setattr("refactorq.core.execution.service._abort_branch_if_needed", lambda root, context: None)
+    monkeypatch.setattr("refactorq.core.execution.run._abort_branch_if_needed", lambda root, context: None)
     monkeypatch.setattr(
         "refactorq.core.execution.service.verify_repo",
         lambda root, *, required_checks=None, candidates=None: VerificationResult(status="passed", checks=[]),
@@ -1875,3 +1884,41 @@ def test_run_preserves_verification_when_git_finalize_fails(tmp_path: Path, monk
     assert result.verification.status == "passed"
     assert result.git.reason == "git commit failed after successful verification"
     assert sample.read_text(encoding="utf-8") == original
+
+
+def test_service_terminal_review_surfaces_share_authoritative_report_view(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    sample = tmp_path / "sample.py"
+    sample.write_text("import os\n", encoding="utf-8")
+
+    scan_result = RefactorQService().scan(tmp_path)
+    report_result = RefactorQService().report(tmp_path, "report")
+    calls: list[Path] = []
+
+    @contextmanager
+    def fake_normalize(source: str | Path) -> Iterator[SimpleNamespace]:
+        yield SimpleNamespace(
+            original=str(source),
+            analysis_root=tmp_path,
+            kind="local",
+            mutable=False,
+            preserved=False,
+        )
+
+    def fake_build_report_view(root: Path) -> tuple[object, object, object]:
+        calls.append(root)
+        return scan_result, report_result.plan, report_result
+
+    monkeypatch.setattr("refactorq.core.service.normalize_repo_source", fake_normalize)
+    monkeypatch.setattr("refactorq.core.service._build_report_view", fake_build_report_view)
+
+    doctor_report = RefactorQService().doctor_source(tmp_path)
+    tui_payload = RefactorQService().tui_source(tmp_path)
+
+    assert calls == [tmp_path, tmp_path]
+    assert doctor_report.source == tui_payload.source
+    assert doctor_report.repo == tui_payload.repo
+    assert doctor_report.facts.candidate_count == len(tui_payload.candidate_rows)
+    assert doctor_report.facts.selected_count == len(tui_payload.selection.selected_rows)
+    assert doctor_report.facts.excluded_count == len(tui_payload.selection.excluded_rows)
+    assert doctor_report.facts.optimizer_selection_source == report_result.plan.selection_source
+    assert tui_payload.selection.optimizer_selection_source == report_result.plan.selection_source

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 
+import orjson
+
 import typer
 from rich.console import Console
-from rich.json import JSON
 
 from refactorq.core.planning import PlanMode
 from refactorq.core.service import RefactorQService
@@ -14,8 +15,9 @@ service = RefactorQService()
 
 
 def _emit_json(payload: object) -> None:
-    console.print(JSON.from_data(payload))
-
+    console.file.write(orjson.dumps(payload).decode("utf-8"))
+    console.file.write("\n")
+    console.file.flush()
 
 @app.command()
 def scan(repo: str = typer.Argument(...)) -> None:
@@ -59,6 +61,27 @@ def report(
     """Summarize plan output and current deterministic execution support."""
     result = service.report_source(repo, mode)
     _emit_json(result.model_dump(by_alias=True))
+
+@app.command()
+def doctor(repo: str = typer.Argument(...)) -> None:
+    """Inspect repository readiness for report-only terminal review."""
+    from refactorq.tui import render_doctor_report
+
+    report = service.doctor_source(repo)
+    render_doctor_report(report, console=console)
+
+
+@app.command()
+def tui(repo: str = typer.Argument(...)) -> None:
+    """Open the report-only terminal candidate browser."""
+    from refactorq.tui import launch_tui
+
+    payload = service.tui_source(repo)
+    try:
+        launch_tui(payload)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command(name="run")

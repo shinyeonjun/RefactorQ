@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
+
 from pydantic import BaseModel, Field
 
 from refactorq.adapters.registry import detect_adapters
@@ -13,6 +16,9 @@ from refactorq.core.repo import RepoSnapshot, detect_repo
 from refactorq.core.repo_source import NormalizedRepoSource, normalize_repo_source
 from refactorq.core.verification import VerificationResult
 from refactorq.core.verification.service import verify_repo
+if TYPE_CHECKING:
+    from refactorq.core.tui.models import DoctorReport, TuiReviewPayload
+
 
 
 class ScanResult(BaseModel):
@@ -45,6 +51,27 @@ def _apply_source_metadata_run(result: RunResult, repo_source: NormalizedRepoSou
     )
 
 
+def _build_plan_from_scan(scan_result: ScanResult, mode: PlanMode) -> PlanResult:
+    return build_plan(
+        mode=mode,
+        repo=scan_result.repo,
+        adapter_names=scan_result.adapter_names,
+        candidates=scan_result.candidates,
+    )
+
+
+def _build_report_from_plan(root: Path, plan_result: PlanResult) -> ReportResult:
+    return report_plan(root, plan_result)
+
+
+def _build_report_view(root: Path) -> tuple[ScanResult, PlanResult, ReportResult]:
+    scan_result = RefactorQService().scan(root)
+    plan_result = _build_plan_from_scan(scan_result, "report")
+    report_result = _build_report_from_plan(root, plan_result)
+    return scan_result, plan_result, report_result
+
+
+
 class RefactorQService:
     def scan_source(self, source: str | Path) -> ScanResult:
         with normalize_repo_source(source) as repo_source:
@@ -68,13 +95,31 @@ class RefactorQService:
         )
 
     def plan(self, root: Path, mode: PlanMode) -> PlanResult:
-        scan_result = self.scan(root)
-        return build_plan(
-            mode=mode,
-            repo=scan_result.repo,
-            adapter_names=scan_result.adapter_names,
-            candidates=scan_result.candidates,
-        )
+        return _build_plan_from_scan(self.scan(root), mode)
+
+
+    def tui_source(self, source: str | Path) -> TuiReviewPayload:
+        from refactorq.core.tui import build_tui_review_payload
+
+        with normalize_repo_source(source) as repo_source:
+            scan_result, _, report_result = _build_report_view(repo_source.analysis_root)
+            return build_tui_review_payload(
+                repo_source=repo_source,
+                scan_result=scan_result,
+                report_result=report_result,
+            )
+
+    def doctor_source(self, source: str | Path) -> DoctorReport:
+        from refactorq.core.tui import build_doctor_report
+
+        with normalize_repo_source(source) as repo_source:
+            scan_result, _, report_result = _build_report_view(repo_source.analysis_root)
+            return build_doctor_report(
+                repo_source=repo_source,
+                scan_result=scan_result,
+                report_result=report_result,
+            )
+
 
     def apply_source(self, source: str | Path, mode: PlanMode) -> ApplyResult:
         with normalize_repo_source(source, mutable=True) as repo_source:
@@ -95,7 +140,7 @@ class RefactorQService:
             return self.report(repo_source.analysis_root, mode)
 
     def report(self, root: Path, mode: PlanMode) -> ReportResult:
-        return report_plan(root, self.plan(root, mode))
+        return _build_report_from_plan(root, self.plan(root, mode))
 
     def run_source(self, source: str | Path, mode: PlanMode) -> RunResult:
         with normalize_repo_source(source, mutable=True) as repo_source:

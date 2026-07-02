@@ -11,3 +11,5 @@ coverage/
 *.egg-info/
 .gjc/
 artifacts/
+openwiki/
+AGENTS.md

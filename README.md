@@ -98,7 +98,17 @@ refactorq apply <repo> --mode safe
 refactorq verify <repo>
 refactorq report <repo> --mode report
 refactorq run <repo> --mode balanced
+refactorq doctor <repo>
+refactorq tui <repo>
 ```
+
+`scan`, `plan`, `apply`, `verify`, `report`, and `run` keep their machine-readable JSON output.
+
+`doctor <repo>` is a repo-scoped readiness check for the terminal review surface. It inspects the same repository input as the JSON commands and renders a human-readable report for report-mode review.
+
+`tui <repo>` opens the slice-1 terminal browser for the same repo-scoped report view. In this slice it is read-only, uses report mode only, and does not apply refactors or switch execution modes.
+
+`doctor` and `tui` are backed by one authoritative report payload derived from the report-mode planner view, so the terminal review surface stays aligned with `refactorq report <repo> --mode report`.
 
 ## Local setup
 
@@ -111,6 +121,18 @@ python -m pip install -U pip
 pip install -e .[dev]
 npm install
 npm run ts:build
+```
+
+To use the terminal TUI, install the optional Textual extra:
+
+```powershell
+pip install -e .[tui]
+```
+
+If you want the development dependencies and the terminal TUI together, install both extras:
+
+```powershell
+pip install -e .[dev,tui]
 ```
 
 ## Verification
