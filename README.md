@@ -1,8 +1,20 @@
 # RefactorQ
 
-RefactorQ is a Python/TypeScript refactoring orchestrator.
+[![Python](https://img.shields.io/badge/runtime-Python%20%2B%20TypeScript-3776AB)](#)
+[![Mode](https://img.shields.io/badge/mode-plan%20before%20apply-0f766e)](#)
 
-It scans a repository, turns refactoring opportunities into a structured Candidate IR, plans a bounded batch, applies deterministic or guarded changes, verifies the result, and rolls back on failure.
+RefactorQ is a Python/TypeScript refactoring orchestrator for turning a noisy repository scan into a **bounded, verifiable, and rollbackable** change batch.
+
+```text
+scan -> candidate IR -> bounded plan -> apply -> verify -> report
+                                              \-> rollback on failure
+```
+
+It separates evidence collection from decision-making: structural adapters find candidates, the planner resolves risk and boundaries, then deterministic or guarded execution applies only an approved scope.
+
+## Why it exists
+
+Refactoring tools often either stop at a generic report or make broad edits with weak proof. RefactorQ keeps the planner authoritative: solver and Codex-assisted paths may propose work, but dependency admission, touched-file boundaries, required checks, and final readiness remain independently verified.
 
 ## Current scope
 
@@ -109,6 +121,18 @@ refactorq tui <repo>
 `tui <repo>` opens the slice-1 terminal browser for the same repo-scoped report view. In this slice it is read-only, uses report mode only, and does not apply refactors or switch execution modes.
 
 `doctor` and `tui` are backed by one authoritative report payload derived from the report-mode planner view, so the terminal review surface stays aligned with `refactorq report <repo> --mode report`.
+
+## Typical workflow
+
+```powershell
+refactorq scan <repo>
+refactorq plan <repo> --mode safe
+refactorq report <repo> --mode report
+refactorq apply <repo> --mode safe
+refactorq verify <repo>
+```
+
+Use `safe` first. Guarded Codex execution remains bounded by candidate IDs, touched-file checks, same-file diff checks, verification, and rollback.
 
 ## Local setup
 
